@@ -19,11 +19,18 @@
 !emp-ot/**
 !docker/
 !docker/**
+# The Console stage invokes these two helpers. Keep other local scripts out.
+!scripts/
+scripts/**
+!scripts/build-qclient-console.sh
+!scripts/qclient-console-version.sh
 
 # Build outputs: the image builds fresh. Nested per-crate target dirs
 # (e.g. crates/quil-engine/fuzz/target) are not matched by `target/` alone.
 target/
 **/target/
+**/node_modules/
+crates/devnet/config/
 node/build/
 crates/quil-client/build/
 .git

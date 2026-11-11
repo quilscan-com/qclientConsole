@@ -268,6 +268,7 @@ ARG TARGETARCH
 ARG QCLIENT_CONSOLE_BUILD_COMMIT=uncommitted
 COPY ./node/execution/intrinsics/global/compat /opt/ceremonyclient/node/execution/intrinsics/global/compat
 WORKDIR /opt/ceremonyclient
+COPY scripts/build-qclient-console.sh scripts/qclient-console-version.sh ./scripts/
 RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/root/.cargo/git,sharing=locked \
     --mount=type=cache,id=console-target-${TARGETOS}-${TARGETARCH},target=/opt/ceremonyclient/target/console-release,sharing=locked \
