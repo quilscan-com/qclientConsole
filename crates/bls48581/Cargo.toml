@@ -1,0 +1,33 @@
+[package]
+name = "bls48581"
+version = "2.1.0"
+edition = "2021"
+authors = ["Quilibrium Inc."]
+description = "BLS signature implementation using the BLS48-581 curve with KZG commitments"
+license = "Apache-2.0"
+repository = "https://github.com/quilibriumnetwork/monorepo"
+keywords = ["bls", "signature", "kzg", "commitment", "cryptography"]
+categories = ["cryptography", "algorithms"]
+readme = "README.md"
+
+[lib]
+crate-type = ["lib", "staticlib"]
+name = "bls48581"
+
+[dependencies]
+hex = "0.4.3"
+serde_json = "1.0.117"
+uniffi = { version= "0.28.3", features = ["cli"] }
+rand = "0.8.5"
+rayon = "1"
+sha2 = "0.10.8"
+
+[dev-dependencies]
+criterion = { version = "0.4", features = ["html_reports"] }
+rand = "0.8.5"
+
+[build-dependencies]
+uniffi = { version = "0.28.3", features = [ "build" ] }
+
+[lints]
+workspace = true

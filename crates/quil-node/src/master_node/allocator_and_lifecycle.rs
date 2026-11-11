@@ -1,0 +1,395 @@
+use std::sync::Arc;
+
+use tracing::{info, warn};
+
+use quil_lifecycle::Supervisor;
+
+pub(crate) struct LifecycleHandles {
+    pub worker_allocator: Arc<quil_engine::worker_allocator::WorkerAllocator>,
+    pub prover_lifecycle: Arc<quil_engine::provers::lifecycle::ProverLifecycle>,
+    pub frame_materializer: Option<Arc<quil_engine::frame_materializer::FrameMaterializer>>,
+}
+
+pub(crate) struct LifecycleInitArgs {
+    pub config: quil_config::Config,
+    pub db: Arc<quil_store::RocksDb>,
+    pub network: u8,
+    pub archive_mode: bool,
+    pub worker_manager: Arc<dyn quil_engine::worker::WorkerManager>,
+    pub prover_registry: Arc<quil_execution::SharedProverRegistry>,
+    pub prover_address: [u8; 32],
+    pub halt_state: Arc<quil_engine::halt_state::HaltState>,
+    pub current_frame: Arc<quil_engine::current_frame::CurrentFrame>,
+    pub last_global_head_frame: Arc<std::sync::atomic::AtomicU64>,
+    pub shards_store: Arc<dyn quil_types::store::ShardsStore>,
+    pub exec_manager: Arc<quil_execution::ExecutionEngineManager>,
+    pub frame_prover: Arc<dyn quil_types::crypto::FrameProver>,
+    pub inclusion_prover: Arc<dyn quil_types::crypto::InclusionProver>,
+    pub clock_store: Arc<quil_store::RocksClockStore>,
+    pub crdt: Arc<quil_hypergraph::HypergraphCrdt>,
+    pub hg_store: Arc<quil_store::RocksHypergraphStore>,
+    pub message_collector: Arc<quil_engine::message_collector::MessageCollector>,
+}
+
+pub(crate) fn init(
+    sup: &mut Supervisor<anyhow::Error>,
+    args: LifecycleInitArgs,
+) -> anyhow::Result<LifecycleHandles> {
+    let LifecycleInitArgs {
+        config,
+        db,
+        network,
+        archive_mode,
+        worker_manager,
+        prover_registry,
+        prover_address,
+        halt_state,
+        current_frame,
+        last_global_head_frame,
+        shards_store,
+        exec_manager,
+        frame_prover,
+        inclusion_prover,
+        clock_store,
+        crdt,
+        hg_store,
+        message_collector,
+    } = args;
+
+    // Worker allocator — reconciles registry vs running workers
+    let worker_allocator = Arc::new(quil_engine::worker_allocator::WorkerAllocator::new(
+        worker_manager.clone(),
+        prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
+        prover_address.to_vec(),
+    ));
+    // Only networks that enable committee sessions consult GLOBAL state here;
+    // an unreadable authorization retains workers, which legacy networks must
+    // never be exposed to.
+    if quil_types::consensus::committee_handoff_policy().is_some() {
+        worker_allocator.set_session_authority(crdt.clone());
+    }
+    {
+        let shards = shards_store.clone();
+        worker_allocator
+            .set_pending_shard_changes(Arc::new(move || shards.all_pending_shard_changes()));
+    }
+    // Workers recover no shard state of a seat this node gives up, judged at
+    // the frame the allocator last reconciled at.
+    if !archive_mode {
+        worker_allocator.install_recovery_gate();
+    }
+
+    // Compute the config-derived seniority estimate from the mainnet
+    // compat table. Uses our local libp2p peer ID plus any peer IDs
+    // derived from the configs listed in
+    // `engine.multisig_prover_enrollment_paths`. Result is cached on
+    // the allocator; lifecycle consults it when deciding whether a
+    // seniority merge would raise our on-chain seniority. Computed
+    // only on mainnet (P2P.Network == 0).
+    if config.p2p.network == 0 {
+        let mut peer_ids: Vec<String> = Vec::new();
+        let pk_bytes = hex::decode(&config.p2p.peer_priv_key).unwrap_or_default();
+        if pk_bytes.len() >= 57 {
+            let mut seed = [0u8; 57];
+            seed.copy_from_slice(&pk_bytes[..57]);
+            let pubkey = quil_p2p::ed448_identity::derive_public_key(&seed);
+            let peer_id = quil_p2p::ed448_identity::peer_id_from_ed448_pubkey(&pubkey);
+            peer_ids.push(bs58::encode(&peer_id).into_string());
+        }
+        for extra_path in &config.engine.multisig_prover_enrollment_paths {
+            let path = std::path::PathBuf::from(extra_path);
+            match quil_config::load_config(&path) {
+                Ok(extra_cfg) => {
+                    if let Ok(bytes) = hex::decode(&extra_cfg.p2p.peer_priv_key) {
+                        if bytes.len() >= 57 {
+                            let mut seed = [0u8; 57];
+                            seed.copy_from_slice(&bytes[..57]);
+                            let pubkey = quil_p2p::ed448_identity::derive_public_key(&seed);
+                            let peer_id =
+                                quil_p2p::ed448_identity::peer_id_from_ed448_pubkey(&pubkey);
+                            peer_ids.push(bs58::encode(&peer_id).into_string());
+                        }
+                    }
+                }
+                Err(e) => warn!(
+                    path = %extra_path,
+                    error = %e,
+                    "could not load multisig prover enrollment config"
+                ),
+            }
+        }
+        let estimate = quil_execution::seniority_compat::get_aggregated_seniority(&peer_ids);
+        worker_allocator.set_config_seniority_estimate(estimate);
+        info!(
+            local_peer_ids = peer_ids.len(),
+            aggregated_seniority = estimate,
+            "computed config-derived seniority estimate"
+        );
+    }
+
+    // Proactive worker allocation reconcile — fire as soon as the
+    // background prover registry refresh has data, independent of
+    // any archive sync. This is the path that pulls workers out of
+    // "filter pinned, consensus deferred" state on startup based on
+    // the LOCALLY persisted prover registry, rather than waiting
+    // for the first global frame to arrive from the archive poller
+    // (which can take 5+ minutes during PeerInfo discovery).
+    //
+    // Archive nodes don't host app-shard workers, so skip the call
+    // there — matches the gate inside the archive poller.
+    if !archive_mode {
+        let wa_for_init = worker_allocator.clone();
+        let pr_for_init = prover_registry.clone();
+        let lhf_for_init = last_global_head_frame.clone();
+        let clock_for_init = clock_store.clone();
+        sup.spawn_startup_task("early-worker-reconcile", move |token_for_init| async move {
+            // The registry loads in the background at startup (18-29 s
+            // on a regular node's store, 2026-10-24); reconciling before
+            // that load ends would find none of our allocations. A fresh
+            // node's empty store loads at once.
+            if !super::archive_sync::await_registry_load(&pr_for_init, &token_for_init, "early worker reconcile").await {
+                return Ok(());
+            }
+            let frame = lhf_for_init.load(std::sync::atomic::Ordering::Relaxed);
+            if frame > 0 {
+                // Only a current stored head: a node back from downtime
+                // judges its seats at its first current frame instead.
+                let stamped = clock_for_init.get_latest_global_frame().ok()
+                    .and_then(|stored| stored.header.map(|header| u64::try_from(header.timestamp).unwrap_or(0)))
+                    .unwrap_or(0);
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_millis() as u64);
+                match wa_for_init.startup_reconcile(frame, stamped, now) {
+                    Err(e) => warn!(
+                        error = %e,
+                        frame,
+                        "early worker reconcile failed"
+                    ),
+                    Ok(true) => info!(frame, "early worker reconcile complete (off local registry)"),
+                    Ok(false) => info!(frame, stored_head_age_secs = now.saturating_sub(stamped) / 1000,
+                        scope = "this node",
+                        "early worker reconcile skipped: the stored GLOBAL head is over an epoch old, so this \
+                         node's seats are judged at its first current frame, after the startup state jump or \
+                         registry sync; its workers start then"),
+                }
+            }
+            Ok(())
+        });
+    }
+
+    // Prover lifecycle coordinator — evaluates join/confirm/leave on each frame.
+    // Pulls cooldown state off the WorkerAllocator (single source of truth).
+    let reward_greedy = config.engine.reward_strategy == "reward-greedy";
+    let strategy = if reward_greedy {
+        quil_engine::provers::proposer::Strategy::RewardGreedy
+    } else {
+        quil_engine::provers::proposer::Strategy::DataGreedy
+    };
+    let lifecycle_inner = quil_engine::provers::lifecycle::ProverLifecycle::new(
+        prover_address.to_vec(),
+        worker_allocator.clone(),
+        halt_state.clone(),
+        current_frame.clone(),
+        strategy,
+    );
+    // Testnet/devnet bootstraps drop the join-confirm window from
+    // mainnet's 360 frames (one hour at 10s/frame) to a handful of
+    // frames so a local smoke test sees a join → confirm cycle in
+    // a couple of minutes. Mainnet (network = 0) keeps the full
+    // 360-frame protocol value.
+    // CLI `--network` is the source of truth — the YAML's `p2p.network`
+    // is left at 0 in our test configs because the same files are used
+    // for mainnet runs. Use the run-time-supplied `network` arg so a
+    // single config file can be reused across networks.
+    if network != 0 {
+        const TESTNET_CONFIRM_WINDOW_FRAMES: u64 = 10;
+        lifecycle_inner.set_confirm_window_frames(TESTNET_CONFIRM_WINDOW_FRAMES);
+        // The lifecycle setting controls *when the local node submits*
+        // a Confirm. The materializer's `validate_confirm_timing`
+        // independently enforces that the recipient ledger has waited
+        // long enough — its default (360..720) is mainnet-correct. For
+        // testnet we have to override that window too, otherwise every
+        // submitted Confirm is rejected as "must wait 360 frames after
+        // join" until 360 frames have elapsed (an hour) — exactly the
+        // wait the lifecycle override is meant to avoid.
+        quil_execution::global_intrinsic::verify::set_confirm_window_frames(
+            TESTNET_CONFIRM_WINDOW_FRAMES,
+            // Use a generous upper bound so a slow follower can still
+            // confirm before the window expires.
+            TESTNET_CONFIRM_WINDOW_FRAMES * 72, // 720 ÷ 360 × 10 = 20 → 720
+        );
+        info!(
+            network,
+            confirm_window_frames = TESTNET_CONFIRM_WINDOW_FRAMES,
+            "testnet/devnet: using shortened prover confirm window",
+        );
+    }
+    // A regular node's grid never flips: its registry shows a split's or
+    // merge's reassignment only once a prover-tree sync brings it in.
+    if !archive_mode {
+        lifecycle_inner.hold_gone_shard_leaves_for_sync();
+    }
+    lifecycle_inner.configure_leave_decision_store(db)?;
+    let prover_lifecycle = Arc::new(lifecycle_inner);
+    // Wire the shards store so `evaluate` can discover shards that
+    // have no allocations yet — calls `RangeAppShards` on the local
+    // store.
+    prover_lifecycle
+        .set_shards_store(shards_store.clone() as Arc<dyn quil_types::store::ShardsStore>);
+
+    // Per the architecture: archives materialize global frames;
+    // workers materialize app-shard frames (a separate path);
+    // non-archive masters only consume the materialized state via
+    // sync from archives and do not materialize themselves.
+    //
+    // Archive nodes get the FrameMaterializer (the canonical
+    // post-finalize processor: commits the hypergraph, verifies the
+    // prover root, processes message bundles, prunes orphan joins,
+    // evicts inactive provers, persists alt-shard updates, publishes
+    // post-materialize snapshots) plus the full frame-header deps on
+    // the intrinsic so `invoke_frame_header` mutates state on
+    // shard-coverage ingest (LastActiveFrameNumber advance + reward
+    // distribution). That full install already wires `frame_prover`.
+    //
+    // Non-archive masters install only `frame_prover` — the minimum
+    // their archive-poller path needs so `process_global_frame` →
+    // `validate_message` → the intrinsic's `TYPE_PROVER_JOIN` arm
+    // doesn't fail closed with "frame_prover not installed".
+    let reward_issuer: Arc<dyn quil_types::consensus::RewardIssuance> =
+        Arc::new(quil_engine::OptRewardIssuance);
+    if archive_mode {
+        let bls_for_intrinsic: Arc<dyn quil_types::crypto::BlsConstructor> =
+            Arc::new(quil_crypto::FalconKeyConstructor);
+        exec_manager
+            .install_global_frame_header_deps(
+                prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
+                reward_issuer.clone(),
+                bls_for_intrinsic,
+                inclusion_prover.clone(),
+                frame_prover.clone(),
+            )
+            .expect("failed to install global frame header dependencies");
+        // This collector feeds GLOBAL proposals.
+        let deferrals = Arc::new(quil_engine::execution_deferral::CollectorDeferrals::default());
+        // Each GLOBAL proposal line counts this gate's tasks and drops.
+        message_collector.set_verify_gate(&super::message_loop::SHARD_FRAME_VERIFY_TASKS);
+        message_collector.set_shard_frame_verifier_with_provenance({
+            let (manager, current, global, deferrals) = (
+                exec_manager.clone(),
+                current_frame.clone(),
+                crdt.clone(),
+                deferrals.clone(),
+            );
+            quil_engine::execution_deferral::collector_verifier(manager, current, global, deferrals)
+        });
+        // A copy of a frame already held verified has only the signers it adds
+        // verified, against their session.
+        message_collector.set_certificate_committees(
+            quil_engine::message_collector::session_committees(crdt.clone()),
+        );
+        // Forget held frames execution passed, and log the end of a wait,
+        // even when no submit arrives.
+        let global = crdt.clone();
+        sup.run_until_cancelled("collector-execution-deferrals", move |token| async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            while !token.is_cancelled() {
+                tick.tick().await;
+                if deferrals.waiting() {
+                    if let Ok(executed) = global
+                        .read_frame_cursor(&quil_store::encoding::global_materialized_cursor_key())
+                    {
+                        deferrals.executed(executed);
+                    }
+                }
+            }
+            Ok(())
+        });
+    } else {
+        exec_manager
+            .install_global_frame_prover(frame_prover.clone())
+            .expect("failed to install global frame prover");
+    }
+    let frame_materializer: Option<Arc<quil_engine::frame_materializer::FrameMaterializer>> =
+        if archive_mode {
+            let m = quil_engine::frame_materializer::FrameMaterializer::new(
+                exec_manager.clone(),
+                prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
+                clock_store.clone() as Arc<dyn quil_types::store::ClockStore>,
+                crdt.clone(),
+                hg_store.clone() as Arc<dyn quil_types::store::HypergraphStore>,
+                reward_issuer,
+                prover_address.to_vec(),
+                archive_mode,
+            )
+            .with_eviction_registry(prover_registry.clone())
+            .with_global_maintenance(quil_engine::frame_maintenance::GlobalMaintenance::new(
+                network,
+                config.engine.genesis_seed.clone(),
+                Vec::new(),
+            ))
+            // Deterministic per-shard data-size source for the eviction
+            // halt gate: enumerate committed shards from the shards store
+            // and key by `confirmation_filter` = L2(32) ++ prefix-byte
+            // (strip the leading L1(3) from shard_key) — exactly how the
+            // registry/worker-allocator key filters. Every archive derives
+            // the same map from the same committed frames, so eviction is
+            // consensus-deterministic. Empty (size==0) shards are thereby
+            // excluded from suppressing eviction.
+            .with_shard_size_source({
+                let ss = shards_store.clone();
+                std::sync::Arc::new(move || {
+                    let mut out: std::collections::HashMap<Vec<u8>, u64> =
+                        std::collections::HashMap::new();
+                    if let Ok(shards) = ss.range_app_shards() {
+                        for s in shards {
+                            let l2_start = if s.shard_key.len() >= 3 { 3 } else { 0 };
+                            // Canonical prefix → filter (sentinel-aware).
+                            let filter = quil_forest::shard_prefix_to_filter(
+                                &s.shard_key[l2_start..],
+                                &s.prefix,
+                            );
+                            if filter.is_empty() {
+                                continue;
+                            }
+                            // `size` is a big-endian byte count; we only need
+                            // "has any data" → record 1 when non-zero.
+                            let has_data = s.size.iter().any(|&b| b != 0);
+                            out.insert(filter, if has_data { 1 } else { 0 });
+                        }
+                    }
+                    out
+                })
+            })
+            .with_current_frame(current_frame.clone())
+            .with_shard_admission_refresh({
+                let store = shards_store.clone();
+                let collector = message_collector.clone();
+                Arc::new(move |frame| {
+                    collector.refresh_valid_shard_addresses(store.as_ref(), frame)
+                })
+            })
+            // MAINNET-ONLY 2.1.0.25 frozen-era recovery: no-op-materialize the
+            // frozen range so the wedged fleet un-sticks deterministically. Off
+            // on localnet/testnet, which never reach these heights anyway.
+            .with_frozen_era_recovery(network == 0)
+            // Same `frame_prover` Arc installed into the intrinsic above, so
+            // the batch-preverified set the materializer records is the one
+            // `verify_frame_header_signature` reads. BLS constructor is
+            // stateless (the set lives on the frame prover), so a fresh one
+            // is equivalent.
+            .with_bls_batch_verify(
+                frame_prover.clone(),
+                Arc::new(quil_crypto::FalconKeyConstructor)
+                    as Arc<dyn quil_types::crypto::BlsConstructor>,
+            );
+            Some(Arc::new(m))
+        } else {
+            None
+        };
+
+    Ok(LifecycleHandles {
+        worker_allocator,
+        prover_lifecycle,
+        frame_materializer,
+    })
+}

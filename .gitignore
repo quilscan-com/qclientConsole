@@ -1,0 +1,109 @@
+.idea/
+node/node
+node/lunchtime-*
+vouchers/
+ceremony-client
+.config*
+.DS_Store
+*.mprof
+.env
+.env.signers
+.env.*
+!.env.example
+!.env.sample
+.netrc
+.npmrc
+.pypirc
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+*.key
+*-private.pem
+*.p12
+*.pfx
+*.log
+/.qclient-console/
+/secrets/
+/credentials.json
+/config.yml
+/config.yaml
+/keys.yml
+/keys.yaml
+.task
+node-tmp-*
+build
+cover.out
+
+# Rust
+target
+
+# Build outputs
+vdf-test*
+/release/
+/dist/
+__pycache__/
+*.py[cod]
+
+# Local isolated feature worktrees
+.worktrees/
+
+# scripts/devnet-smoke.sh
+.devnet-smoke/
+# scripts/devnet-shard-info.sh
+.devnet-shard-info/
+
+# Keep local documentation, independent tests, fixtures and benchmarks local.
+/docs/
+**/test/
+**/tests/
+**/testdata/
+**/test-data/
+**/test_data/
+**/fixtures/
+**/bench/
+**/benches/
+*_test.go
+*_tests.rs
+*_test.rs
+test_*.rs
+test.rs
+tests.rs
+testing.rs
+test_helpers.go
+test_helpers.rs
+test_utils.rs
+testutils.rs
+test_support.rs
+test_alloc.rs
+*.test.js
+*.test.mjs
+*.test.ts
+*.test.tsx
+*.spec.js
+*.spec.mjs
+*.spec.ts
+*.spec.tsx
+test_*.py
+*_test.py
+/scripts/test-persistent-storage.py
+/crates/quil-lattice-proof-sys/tools/check_native_codec.py
+
+# Upstream local-devnet fixtures contain published test credentials. They are
+# not used by the Console distribution and stay only in this local checkout.
+/crates/devnet/config/
+
+# The application workflow builds production files; upstream test workflows
+# depend on the independent tests intentionally retained only in this checkout.
+/.github/workflows/rust-ci.yml
+/.github/workflows/devnet-smoke.yml
+
+# These modules are compiled by normal builds or exposed Cargo features.
+!/crates/quil-store/src/testing.rs
+!/crates/quil-execution/src/testing.rs
+!/crates/quil-hypergraph/src/testing.rs
+!/crates/quil-engine/src/test_support.rs
+!/crates/libp2p-kad/src/behaviour/test.rs
+!/crates/quil-execution/src/test_hooks.rs
+!/crates/quil-node/src/test_prover_sync.rs
+!/crates/quil-node/src/bin/prover_join_test.rs

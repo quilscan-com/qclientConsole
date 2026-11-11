@@ -1,0 +1,158 @@
+name: qclient-console release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qclient-console-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "4"
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_UPGRADE: "1"
+
+jobs:
+  metadata:
+    name: Source version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve the compiled source version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(bash scripts/qclient-console-version.sh)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Console version: $version"
+
+  web:
+    name: Build embedded Web UI
+    runs-on: ubuntu-latest
+    needs: metadata
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: crates/quil-client-console/web/package-lock.json
+      - name: Build Web assets
+        working-directory: crates/quil-client-console/web
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qclient-console-web
+          path: crates/quil-client-console/web/dist/
+          if-no-files-found: error
+
+  linux-amd64:
+    name: Build linux-amd64
+    runs-on: ubuntu-latest
+    needs: [metadata, web]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: qclient-console-web
+          path: crates/quil-client-console/web/dist/
+      - name: Build Console on Ubuntu 22.04
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --ulimit stack=-1:-1 --platform linux/amd64 \
+            -f docker/Dockerfile.source --target qclient-console \
+            --build-arg "QCLIENT_CONSOLE_BUILD_COMMIT=$GITHUB_SHA" \
+            --output type=local,dest=release .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qclient-console-linux-amd64
+          path: release/qclient-console-${{ needs.metadata.outputs.version }}-linux-amd64
+          if-no-files-found: error
+
+  darwin-arm64:
+    name: Build darwin-arm64
+    runs-on: macos-15
+    needs: [metadata, web]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: qclient-console-web
+          path: crates/quil-client-console/web/dist/
+      - name: Confirm native runner architecture
+        run: test "$(uname -m)" = arm64
+      - name: Prepare static native dependencies
+        id: native
+        uses: ./.github/actions/setup-native-deps
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+          cache: false
+      - name: Cache Rust dependencies and Console build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/console-release
+          key: console-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'crates/quil-client-console/Cargo.lock', '.github/actions/setup-native-deps/action.yml') }}
+      - name: Build Console and verify its version
+        env:
+          FLINT_DIR: ${{ steps.native.outputs.flint-dir }}
+          EMP_DIR: /usr/local
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/console-release
+          QCLIENT_CONSOLE_BUILD_COMMIT: ${{ github.sha }}
+        run: bash scripts/build-qclient-console.sh darwin-arm64 release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qclient-console-darwin-arm64
+          path: release/qclient-console-${{ needs.metadata.outputs.version }}-darwin-arm64
+          if-no-files-found: error
+
+  sign:
+    name: Sign and verify build artifacts
+    runs-on: ubuntu-latest
+    needs: [metadata, linux-amd64, darwin-arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: qclient-console-linux-amd64
+          path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          name: qclient-console-darwin-arm64
+          path: dist/
+      - name: Sign binary files with the existing release key
+        env:
+          DEV_NODE_SIGNING_PRIVATE_KEY: ${{ secrets.DEV_NODE_SIGNING_PRIVATE_KEY }}
+          QCLIENT_CONSOLE_RELEASE_BASE_URL: ${{ vars.QCLIENT_CONSOLE_RELEASE_BASE_URL }}
+          CONSOLE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: bash scripts/sign-qclient-console-artifacts.sh "$CONSOLE_VERSION" dist
+      - name: Independently verify the signed bundle
+        env:
+          CONSOLE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: bash scripts/verify-qclient-console-artifacts.sh "$CONSOLE_VERSION" dist
+      - name: Upload signed bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: qclient-console-release-${{ needs.metadata.outputs.version }}
+          path: dist/qclient-console-*
+          if-no-files-found: error

@@ -1,0 +1,2808 @@
+//! Genesis loading and initialization — parses the embedded mainnet genesis
+//! JSON, seeds the prover registry, and stores the initial frame + QC.
+
+use std::sync::Arc;
+
+use base64::Engine;
+use num_bigint::BigInt;
+use quil_crypto::poseidon::hash_bytes_to_32;
+use quil_execution::global_intrinsic::materialize;
+use quil_execution::global_schema::{write_field, write_type, GLOBAL_INTRINSIC_ADDRESS};
+use quil_execution::hypergraph_state::{self, HypergraphState};
+use quil_execution::prover_registry;
+use quil_hypergraph::HypergraphCrdt;
+use quil_types::error::{QuilError, Result};
+use quil_types::proto::global;
+use quil_types::proto::keys;
+use quil_types::store::{ClockStore, ShardKey, ShardsStore};
+use serde::Deserialize;
+use tracing::{debug, info, warn};
+
+/// Embedded mainnet genesis JSON.
+const MAINNET_GENESIS_JSON: &[u8] = include_bytes!("../mainnet_genesis.json");
+
+/// Expected frame number for mainnet genesis.
+pub const MAINNET_GENESIS_FRAME_NUMBER: u64 = 244200;
+
+/// Beacon seniority value for mainnet genesis.
+///
+/// This is the output of `compat::GetAggregatedSeniority([beacon_peer_id])`
+/// for the beacon prover at genesis. The same seniority is applied to
+/// ALL genesis provers (beacon + archive peers).
+///
+/// Deterministic derivation from the embedded retro JSONs:
+/// * First retro (`reward=157208`): `10*6*60*24*92 / (157208/157208)` = 7,948,800
+/// * Second retro (feb+mar+apr+may present): `10*6*60*24*(29+31+30+31)` = 10,454,400
+/// * Third retro (present): `10*6*60*24*30` = 2,592,000
+/// * Fourth retro (present): `10*6*60*24*31` = 2,678,400
+/// * Sum: 23,673,600
+///
+/// `mainnet_244200_seniority.json` may additionally raise this via
+/// `max(retro_sum, mainnet_entry)` — the `seniority_compat` module
+/// handles both. The constant must match the canonical compat table;
+/// `mainnet_beacon_seniority_matches_compat_table` asserts it at build
+/// time so any divergence fails loudly instead of silently producing
+/// an incompatible genesis prover tree commitment.
+pub const MAINNET_BEACON_SENIORITY: u64 = 23_673_600;
+
+/// Parsed genesis data from JSON.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GenesisData {
+    pub frame_number: u64,
+    pub timestamp: i64,
+    pub difficulty: u32,
+    /// Base64-encoded parent selector (32 bytes).
+    pub parent_selector: String,
+    /// Map of hex key (32 bytes) to base64 value (64 bytes).
+    /// Initial shard commitments.
+    pub initial_commitments: std::collections::HashMap<String, String>,
+    /// Base64-encoded VDF output (516 bytes).
+    pub output: String,
+    /// Base64-encoded Ed448 public key of the beacon prover.
+    pub beacon_ed448_key: String,
+    /// Base64-encoded BLS48-581 G2 public key of the beacon prover.
+    pub beacon_bls48581_key: String,
+    /// Map of peer ID to hex-encoded BLS48-581 public key for archive provers.
+    pub archive_peers: std::collections::HashMap<String, String>,
+}
+
+/// Load and parse the embedded mainnet genesis JSON.
+pub fn get_mainnet_genesis_data() -> Result<GenesisData> {
+    serde_json::from_slice(MAINNET_GENESIS_JSON)
+        .map_err(|e| QuilError::Internal(format!("failed to parse genesis JSON: {}", e)))
+}
+
+/// Build a `GlobalFrame` proto from genesis data (header only, no prover
+/// seeding). Use `initialize_genesis_state` for the full initialization.
+pub fn build_genesis_frame(genesis: &GenesisData) -> Result<global::GlobalFrame> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    let parent_selector = b64
+        .decode(&genesis.parent_selector)
+        .map_err(|e| QuilError::Internal(format!("bad genesis parent_selector: {}", e)))?;
+    let output = b64
+        .decode(&genesis.output)
+        .map_err(|e| QuilError::Internal(format!("bad genesis output: {}", e)))?;
+
+    if output.len() != 516 {
+        return Err(QuilError::Internal(format!(
+            "genesis output should be 516 bytes, got {}",
+            output.len()
+        )));
+    }
+    if parent_selector.len() != 32 {
+        return Err(QuilError::Internal(format!(
+            "genesis parent_selector should be 32 bytes, got {}",
+            parent_selector.len()
+        )));
+    }
+
+    // Decode beacon BLS key (used as the genesis frame prover)
+    let beacon_bls_key = b64
+        .decode(&genesis.beacon_bls48581_key)
+        .map_err(|e| QuilError::Internal(format!("bad genesis beacon BLS key: {}", e)))?;
+
+    // Build frame header
+    let header = global::GlobalFrameHeader {
+        frame_number: genesis.frame_number,
+        timestamp: genesis.timestamp,
+        difficulty: genesis.difficulty,
+        parent_selector: parent_selector.clone(),
+        output: output.clone(),
+        prover: beacon_bls_key,
+        prover_tree_commitment: vec![0u8; 64], // Filled in by initialize_genesis_state
+        requests_root: Vec::new(),
+        ..Default::default()
+    };
+
+    info!(
+        frame_number = genesis.frame_number,
+        timestamp = genesis.timestamp,
+        difficulty = genesis.difficulty,
+        output_len = output.len(),
+        archive_peers = genesis.archive_peers.len(),
+        "parsed mainnet genesis"
+    );
+
+    Ok(global::GlobalFrame {
+        header: Some(header),
+        requests: Vec::new(),
+    })
+}
+
+/// Return the expected genesis frame number for the given network.
+///
+/// - Network 0 (mainnet): Returns `MAINNET_GENESIS_FRAME_NUMBER`
+/// - Other networks (testnet/devnet): Returns 0
+pub fn expected_genesis_frame_number(network: u32) -> u64 {
+    match network {
+        0 => MAINNET_GENESIS_FRAME_NUMBER,
+        _ => 0,
+    }
+}
+
+/// Load the mainnet genesis frame. Convenience function that combines
+/// `get_mainnet_genesis_data()` and `build_genesis_frame()`.
+pub fn load_mainnet_genesis() -> Result<global::GlobalFrame> {
+    let data = get_mainnet_genesis_data()?;
+    build_genesis_frame(&data)
+}
+
+/// Get the list of initial archive peer BLS public keys from genesis.
+/// Returns pairs of (peer_id, bls_pubkey_bytes). The network peer-id is DERIVED
+/// from the archive's FALCON prover key (the network identity under the Falcon
+/// migration) rather than the baked Ed448 peer-id string, so it matches the
+/// peer-id the archive actually presents on the wire — no genesis-data re-cut
+/// of the map keys is required.
+pub fn genesis_archive_peers() -> Result<Vec<(String, Vec<u8>)>> {
+    let data = get_mainnet_genesis_data()?;
+    let mut peers = Vec::new();
+    for (baked_id, pubkey_hex) in &data.archive_peers {
+        let pubkey = hex::decode(pubkey_hex).map_err(|e| {
+            QuilError::Internal(format!(
+                "bad genesis archive peer key for {}: {}",
+                baked_id, e
+            ))
+        })?;
+        let peer_id = bs58::encode(quil_p2p::peer_id_from_falcon_pubkey(&pubkey)).into_string();
+        peers.push((peer_id, pubkey));
+    }
+    Ok(peers)
+}
+
+/// The mainnet GLOBAL committee from
+/// [`quil_types::consensus::MAINNET_GLOBAL_COMMITTEE_SUCCESSION_FRAME`] on:
+/// the genesis archives less the decommissioned ones
+/// ([`quil_config::DECOMMISSIONED_GENESIS_ARCHIVES`]). The genesis
+/// `archive_peers` themselves never change; frames before the succession stay
+/// verified against all of them.
+pub fn genesis_archive_successor_peers() -> Result<Vec<(String, Vec<u8>)>> {
+    Ok(genesis_archive_peers()?
+        .into_iter()
+        .filter(|(peer_id, _)| {
+            !quil_config::DECOMMISSIONED_GENESIS_ARCHIVES.contains(&peer_id.as_str())
+        })
+        .collect())
+}
+
+/// Static QUIC multiaddrs for the genesis archive peers.
+///
+/// `genesis_archive_peers()` only carries `(peer_id, bls_pubkey)` —
+/// the network address is normally learned via PeerInfo gossip after
+/// libp2p bootstrap fans out. On a fresh node where the libp2p mesh
+/// hasn't converged yet, the archive pool stays empty and the
+/// shard-info remote fallback has nowhere to dial.
+///
+/// These addresses are hardcoded operator-known endpoints for the
+/// genesis archives — they should be kept in sync with mainnet
+/// operator records. Update when an operator rotates IPs.
+pub fn genesis_archive_static_multiaddrs() -> Vec<&'static str> {
+    // Single source of truth: the P2P mainnet bootstrap list (the archives ARE
+    // the DHT bootstraps). Kept here as the `:8340` archive-pool seed derives
+    // `host:8340` from these same `host:8336` multiaddrs
+    // (`genesis_archive_static_ips`). Deduped against `quil-config` so the
+    // gossip-bootstrap and archive-pool lists can never drift apart (a drift
+    // that once left the pre-Falcon peer IDs in the bootstrap list while the
+    // archives presented Falcon identities → dead gossip mesh).
+    quil_config::MAINNET_BOOTSTRAP_PEERS.to_vec()
+}
+
+/// Helper: extract `(peer_id_str, ip_str)` from each genesis-archive
+/// QUIC multiaddr. Used by `main.rs` to derive the corresponding
+/// `host:8340` mTLS endpoints to seed the archive pool.
+pub fn genesis_archive_static_ips() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for ma in genesis_archive_static_multiaddrs() {
+        let parts: Vec<&str> = ma.trim_start_matches('/').split('/').collect();
+        let mut ip: Option<String> = None;
+        let mut peer: Option<String> = None;
+        let mut i = 0;
+        while i < parts.len() {
+            match parts[i] {
+                "ip4" | "ip6" if i + 1 < parts.len() => {
+                    ip = Some(parts[i + 1].to_string());
+                    i += 2;
+                }
+                "p2p" if i + 1 < parts.len() => {
+                    peer = Some(parts[i + 1].to_string());
+                    i += 2;
+                }
+                _ => i += 1,
+            }
+        }
+        if let (Some(p), Some(a)) = (peer, ip) {
+            out.push((p, a));
+        }
+    }
+    out
+}
+
+/// Verify that a frame from the store matches the expected genesis.
+/// Returns Ok(true) if the frame matches, Ok(false) if it doesn't,
+/// or Err if genesis data can't be loaded.
+pub fn verify_genesis_frame(frame: &global::GlobalFrame) -> Result<bool> {
+    let genesis = get_mainnet_genesis_data()?;
+    let expected = build_genesis_frame(&genesis)?;
+
+    let h = match frame.header.as_ref() {
+        Some(h) => h,
+        None => return Ok(false),
+    };
+    let eh = match expected.header.as_ref() {
+        Some(eh) => eh,
+        None => return Err(QuilError::Internal("genesis frame has no header".into())),
+    };
+
+    Ok(h.frame_number == eh.frame_number
+        && h.output == eh.output
+        && h.parent_selector == eh.parent_selector
+        && h.timestamp == eh.timestamp
+        && h.difficulty == eh.difficulty)
+}
+
+// =========================================================================
+// Full genesis initialization
+// =========================================================================
+
+/// Initialize the full genesis state for mainnet.
+///
+/// 1. Checks if the genesis frame already exists in `clock_store`. If yes,
+/// returns it along with the latest QC.
+/// 2. Parses the embedded mainnet genesis JSON.
+/// 3. Seeds initial commitments into the shards store.
+/// 4. Establishes genesis provers in the hypergraph CRDT via
+/// `HypergraphState` — creating Prover and ProverAllocation vertices
+/// with hyperedge connections.
+/// 5. Commits the hypergraph and computes `ProverTreeCommitment`.
+/// 6. Computes the 256 global commitments from VectorCommitmentTrees.
+/// 7. Stores the genesis frame and QC in `clock_store`.
+/// 8. Returns the completed frame and QC.
+///
+/// The caller is responsible for initializing consensus/liveness state
+/// (via `ConsensusStore::put_liveness_state`/`put_consensus_state`)
+/// after this function returns.
+pub fn initialize_genesis_state(
+    clock_store: &dyn ClockStore,
+    shards_store: &dyn ShardsStore,
+    hypergraph: &Arc<HypergraphCrdt>,
+    inclusion_prover: &(dyn quil_types::crypto::InclusionProver + Sync),
+) -> Result<(global::GlobalFrame, global::QuorumCertificate)> {
+    info!("initializing genesis frame for global consensus");
+
+    // 1. Check if genesis already exists
+    let genesis_data = get_mainnet_genesis_data()?;
+    if let Ok(existing) = clock_store.get_global_clock_frame(genesis_data.frame_number) {
+        if existing.header.is_some() {
+            info!(
+                frame_number = genesis_data.frame_number,
+                "genesis frame already exists in clock store"
+            );
+            // Return existing frame + latest QC
+            let qc = clock_store
+                .get_latest_quorum_certificate(&[])
+                .unwrap_or_else(|_| make_genesis_qc(&existing));
+            return Ok((existing, qc));
+        }
+    }
+
+    // 2. Build the base genesis frame
+    let mut genesis_frame = build_genesis_frame(&genesis_data)?;
+    let header = genesis_frame.header.as_mut().unwrap();
+
+    // Initialize 256 global commitments
+    header.global_commitments = vec![vec![0u8; 64]; 256];
+
+    // 3. Seed initial commitments into shards store + VectorCommitmentTrees
+    let mut commitment_trees: Vec<quil_tries::VectorCommitmentTree> = (0..256)
+        .map(|_| quil_tries::VectorCommitmentTree::new())
+        .collect();
+
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    for (hex_key, base64_value) in &genesis_data.initial_commitments {
+        let key_bytes = hex::decode(hex_key).map_err(|e| {
+            QuilError::Internal(format!(
+                "failed to decode commitment key {}: {}",
+                hex_key, e
+            ))
+        })?;
+
+        let commitment_value = b64.decode(base64_value).map_err(|e| {
+            QuilError::Internal(format!("failed to decode commitment value: {}", e))
+        })?;
+
+        let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&key_bytes, 256, 3);
+
+        // shard_key layout in the rocks store is L1[3] || L2[32].
+        // Without the L1 prefix, range_app_shards mis-slices 3 bytes
+        // of the encoded path as part of the returned shard_key,
+        // which empties the TUI "available shards" panel.
+        let mut shard_key = Vec::with_capacity(3 + key_bytes.len());
+        shard_key.extend_from_slice(&l1);
+        shard_key.extend_from_slice(&key_bytes);
+
+        // Store app shard entries. QUIL_TOKEN is seeded pre-split into 64
+        // shards (a single-nibble prefix): 4096 shards each need their own
+        // quorum of workers, which at current participation spreads coverage
+        // too thin and halts the network, while 64 keeps each shard's worker
+        // count above the halt threshold. EVERY OTHER app defaults to a SINGLE
+        // shard (empty prefix = the whole app) and splits dynamically via
+        // shard-split logic as it grows — the same partition the forest uses
+        // (`quil_forest_migrate::quil_shards_for_app`).
+        let is_quil = key_bytes == quil_execution::domains::QUIL_TOKEN;
+        let txn = clock_store.new_transaction(false)?;
+        if is_quil {
+            // Canonical SENTINEL 64-way genesis (never legacy byte-suffix `[i]`) so
+            // the local grid, and every filter derived from it, is sentinel from
+            // frame 0 — the same format the split-reset commits.
+            for prefix in quil_forest::genesis_grid_prefixes(0) {
+                shards_store.put_app_shard(
+                    txn.as_ref(),
+                    &quil_types::store::ShardInfo {
+                        shard_key: shard_key.clone(),
+                        prefix,
+                        size: Vec::new(),
+                        data_shards: 0,
+                        commitment: Vec::new(),
+                    },
+                )?;
+            }
+        } else {
+            shards_store.put_app_shard(
+                txn.as_ref(),
+                &quil_types::store::ShardInfo {
+                    shard_key: shard_key.clone(),
+                    prefix: vec![],
+                    size: Vec::new(),
+                    data_shards: 0,
+                    commitment: Vec::new(),
+                },
+            )?;
+        }
+        txn.commit()?;
+
+        // Insert into the 3 bloom-selected commitment trees
+        for i in 0..3 {
+            let idx = l1[i] as usize;
+            commitment_trees[idx].insert(
+                &key_bytes,
+                &commitment_value,
+                &[],
+                &BigInt::from(commitment_value.len() as u64),
+            )?;
+            commitment_trees[idx].commit(inclusion_prover);
+        }
+    }
+
+    // 4. Establish genesis provers in the hypergraph
+    let state = HypergraphState::new(hypergraph.clone());
+    establish_mainnet_genesis_provers(&state, &genesis_data)?;
+    state.commit()?;
+
+    // 5. Commit the hypergraph and extract prover tree commitment
+    let roots = hypergraph.commit(0)?;
+
+    // The global intrinsic address shard key has L1=[0,0,0] and
+    // L2=GLOBAL_INTRINSIC_ADDRESS
+    let global_shard_key = ShardKey {
+        l1: [0u8; 3],
+        l2: GLOBAL_INTRINSIC_ADDRESS,
+    };
+
+    let prover_root = match roots.get(&global_shard_key) {
+        Some(shard_roots) if !shard_roots.is_empty() => shard_roots[0].clone(),
+        _ => {
+            warn!("no prover tree roots after commit, using empty root");
+            vec![0u8; 64]
+        }
+    };
+
+    header.prover_tree_commitment = prover_root;
+
+    // 6. Compute 256 global commitments
+    for i in 0..256 {
+        header.global_commitments[i] = commitment_trees[i].commit(inclusion_prover);
+    }
+
+    // 7. Set empty signature payload — avoids panics on header readers.
+    header.public_key_signature_bls48581 = Some(keys::Bls48581AggregateSignature {
+        signature: Vec::new(),
+        public_key: Some(keys::Bls48581g2PublicKey {
+            key_value: Vec::new(),
+        }),
+        bitmask: Vec::new(),
+    });
+
+    // 8. Store in clock store
+    let txn = clock_store.new_transaction(false)?;
+    clock_store.put_global_clock_frame(&genesis_frame, txn.as_ref())?;
+
+    let genesis_qc = make_genesis_qc(&genesis_frame);
+    clock_store.put_quorum_certificate(&genesis_qc, txn.as_ref())?;
+    txn.commit()?;
+
+    info!("initialized genesis frame for global consensus");
+    Ok((genesis_frame, genesis_qc))
+}
+
+/// Build the genesis QuorumCertificate for a genesis frame.
+fn make_genesis_qc(frame: &global::GlobalFrame) -> global::QuorumCertificate {
+    let header = frame.header.as_ref().unwrap();
+
+    // Selector = poseidon(output) — matches GlobalFrame.Identity()
+    let selector = hash_bytes_to_32(&header.output)
+        .map(|h| h.to_vec())
+        .unwrap_or_else(|_| vec![0u8; 32]);
+
+    global::QuorumCertificate {
+        rank: 0,
+        filter: Vec::new(),
+        frame_number: header.frame_number,
+        selector,
+        timestamp: 0,
+        aggregate_signature: Some(keys::Bls48581AggregateSignature {
+            public_key: Some(keys::Bls48581g2PublicKey {
+                key_value: vec![0u8; 585],
+            }),
+            signature: vec![0u8; 74],
+            bitmask: vec![0xFFu8; 32],
+        }),
+    }
+}
+
+// =========================================================================
+// Prover seeding
+// =========================================================================
+
+/// Seed genesis provers into the hypergraph. Creates Prover +
+/// ProverAllocation vertices for the beacon prover and each archive
+/// peer, all with the same aggregated seniority.
+fn establish_mainnet_genesis_provers(
+    state: &HypergraphState,
+    genesis_data: &GenesisData,
+) -> Result<()> {
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    // The aggregated-seniority lookup over the beacon Ed448 peer ID
+    // resolves to MAINNET_BEACON_SENIORITY.
+    let seniority = MAINNET_BEACON_SENIORITY;
+
+    debug!(
+        seniority = seniority,
+        "establishing seniority for beacon from aggregated records"
+    );
+
+    // Decode beacon BLS key
+    let beacon_bls_key = b64
+        .decode(&genesis_data.beacon_bls48581_key)
+        .map_err(|e| QuilError::Internal(format!("failed to decode beacon BLS key: {}", e)))?;
+
+    // Add beacon prover
+    add_genesis_prover(state, &beacon_bls_key, seniority, genesis_data.frame_number)?;
+
+    // Add archive peers (all use same seniority as beacon)
+    for (peer_id, pubkey_hex) in &genesis_data.archive_peers {
+        let pubkey = hex::decode(pubkey_hex).map_err(|e| {
+            QuilError::Internal(format!(
+                "failed to decode archive peer key for {}: {}",
+                peer_id, e
+            ))
+        })?;
+
+        add_genesis_prover(state, &pubkey, seniority, genesis_data.frame_number)?;
+    }
+
+    Ok(())
+}
+
+/// Upsert the global-committee provers into the prover tree at
+/// `MAINNET_BEACON_SENIORITY` — CORRECT the seniority of an existing prover, or
+/// SEED a missing one (creating the full Prover + Allocation + hyperedge via the
+/// same `add_prover_on_filter` genesis uses). The seed branch is what installs
+/// the Falcon global provers on a **re-bootstrapped / freshly-migrated DB whose
+/// global prover tree is empty** (the KZG→JMT migration only carries over shards
+/// that hold state, so an emptied prover shard is skipped — see
+/// `quil_forest_migrate`). This is the ONLY place the global committee is
+/// (re)created post-genesis, since `initialize_genesis_state` short-circuits
+/// once a genesis frame is committed.
+///
+/// Background: the global archive provers are established at genesis with
+/// [`MAINNET_BEACON_SENIORITY`]. On the re-bootstrapped mainnet, a
+/// post-migration event (the pre-fix eviction bug that kicked global
+/// provers — eviction zeroes Seniority) left every global prover with
+/// `Seniority = 0` in the committed prover tree. Because the global
+/// consensus quorum threshold is `(Σ seniority · 2) / 3` (see
+/// `quil_engine::committee`), zero total weight collapses the threshold to
+/// **0** — a single zero-weight vote then satisfies any QC/TC, so the
+/// committee forks into per-archive solo chains and global consensus can
+/// never finalize across archives (the observed "one producer, everyone
+/// else times out" halt).
+///
+/// This restores each global prover's Seniority to `MAINNET_BEACON_SENIORITY`
+/// (the genesis value — all archives share the beacon's seniority),
+/// **preserving every other field** on the vertex (Status, PublicKey,
+/// AvailableStorage) by loading the existing vertex and rewriting only the
+/// one field. It is:
+/// * **deterministic** — the prover set (beacon + genesis archive peers)
+/// and the value are fixed constants and the vertex data is independent
+/// of the frame number, so every archive converges on the byte-identical
+/// corrected prover-tree root;
+/// * **idempotent** — a prover already at the correct seniority is skipped,
+/// and nothing is committed if all are already correct, so it is safe to
+/// run on every startup.
+///
+/// The eviction path that caused the loss is now gated off global provers
+/// (empty `ConfirmationFilter`), so the value will not be re-zeroed. Run on
+/// archives at startup, before consensus; non-archives converge via
+/// hypersync of the corrected tree. Returns the number of provers corrected or
+/// seeded. Idempotent: a re-run finds the seeded provers and skips them.
+pub fn restore_global_prover_seniority(
+    hypergraph: &Arc<HypergraphCrdt>,
+    frame_number: u64,
+) -> Result<usize> {
+    let genesis_data = get_mainnet_genesis_data()?;
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    // The fixed global-committee prover set: beacon + genesis archive peers,
+    // all established with MAINNET_BEACON_SENIORITY. Iterate archive peers in
+    // a stable (peer-id-sorted) order — the resulting tree is independent of
+    // order, but stable ordering keeps the logs deterministic.
+    let mut pubkeys: Vec<Vec<u8>> = Vec::new();
+    pubkeys.push(b64.decode(&genesis_data.beacon_bls48581_key).map_err(|e| {
+        QuilError::Internal(format!("restore seniority: decode beacon BLS key: {}", e))
+    })?);
+    let mut archives: Vec<(&String, &String)> = genesis_data.archive_peers.iter().collect();
+    archives.sort_by(|a, b| a.0.cmp(b.0));
+    for (peer_id, pubkey_hex) in archives {
+        pubkeys.push(hex::decode(pubkey_hex).map_err(|e| {
+            QuilError::Internal(format!(
+                "restore seniority: decode archive key {}: {}",
+                peer_id, e
+            ))
+        })?);
+    }
+
+    let va_disc = hypergraph_state::vertex_adds_discriminator()?;
+    let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+    let want = MAINNET_BEACON_SENIORITY;
+
+    let state = HypergraphState::new(hypergraph.clone());
+    let mut fixed = 0usize;
+
+    for pubkey in &pubkeys {
+        let prover_address = materialize::prover_address_from_pubkey(pubkey)?;
+        // Upsert: CORRECT an existing prover vertex, or SEED a missing one.
+        // A missing vertex is expected on a re-bootstrapped / freshly-migrated
+        // DB whose global prover tree is empty (e.g. the KZG→JMT migration only
+        // carried over the QUIL token tree). Seeding uses the same logic genesis
+        // uses (`add_prover_on_filter` with the empty/global filter), so the
+        // Falcon global provers + beacon land at their `poseidon(pubkey)`
+        // addresses with `MAINNET_BEACON_SENIORITY` — the only place they get
+        // created post-genesis.
+        let Some(blob) = state.get(domain, &prover_address, va_disc.as_slice())? else {
+            add_prover_on_filter(&state, pubkey, want, frame_number, &[])?;
+            info!(
+                address = %hex::encode(prover_address),
+                seniority = want,
+                "restore_global_prover_seniority: seeded missing global prover"
+            );
+            fixed += 1;
+            continue;
+        };
+        let mut tree = prover_registry::rebuild_vertex_tree_from_blob(&blob);
+        let current =
+            quil_execution::global_schema::read_field(&tree, "prover:Prover", "Seniority")
+                .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+                .map(u64::from_be_bytes)
+                .unwrap_or(0);
+        if current == want {
+            continue;
+        }
+        write_field(&mut tree, "prover:Prover", "Seniority", &want.to_be_bytes())?;
+        let new_blob = prover_registry::vertex_tree_to_blob(&tree);
+        state.set(
+            domain,
+            &prover_address,
+            va_disc.as_slice(),
+            frame_number,
+            new_blob,
+        )?;
+        info!(
+            address = %hex::encode(prover_address),
+            was = current,
+            now = want,
+            "restore_global_prover_seniority: corrected global prover seniority"
+        );
+        fixed += 1;
+    }
+
+    if fixed > 0 {
+        state.commit()?;
+        hypergraph.commit(frame_number)?;
+        info!(
+            fixed,
+            frame = frame_number,
+            "restore_global_prover_seniority: committed seniority corrections"
+        );
+    } else {
+        info!("restore_global_prover_seniority: all global provers already at correct seniority (no-op)");
+    }
+
+    Ok(fixed)
+}
+
+/// Flag-day RESET of the global prover tree, riding the unified-tree cutover.
+/// The deep-split machinery left the prover tree carrying provers stranded on
+/// alias sub-shards; rather than surgically remove them (the forest JMT is
+/// put-only, so a per-vertex remove can't shrink it AND leaves the committed
+/// adds root unchanged, so it never reaches syncing nodes), this WIPES the whole
+/// global prover shard — BOTH the vertex and hyperedge phase trees plus the flat
+/// blob keyspace the registry reads — and REBUILDS it from the genesis committee.
+///
+/// The rebuild reuses the SAME established seeders that create the on-chain
+/// provers, so the vertices land at their exact addresses (`poseidon` of the
+/// FALCON prover key — the network identity under the Falcon migration; the
+/// genesis `archive_peers` values ARE those Falcon keys, fed to
+/// `peer_id_from_falcon_pubkey` in [`genesis_archive_peers`]):
+/// - **mainnet**: [`restore_global_prover_seniority`] (its from-empty "seed
+///   missing" branch reinstalls the beacon + archives) + [`remove_offline_global_prover`]
+///   (kicks the permanently-removed archive → 5-member active committee);
+/// - **testnet/localnet**: the seed-resolved Falcon provers
+///   ([`resolve_testnet_prover_keys`], 897-byte keys) at the testnet genesis
+///   seniority (1000, matching [`initialize_testnet_genesis_state`]).
+///
+/// Deterministic (fixed prover set + values, frame-independent vertex data) so
+/// every archive converges on the byte-identical prover-tree root, and the root
+/// CHANGES (the whole shard is rebuilt), so it lands in the cutover frame's
+/// `prover_tree_commitment` and propagates to syncing nodes — which is what makes
+/// the stranded provers re-join onto the reset grid. Archive-only (materializing
+/// nodes); regulars sync the post-reset tree. The seeders commit into the CRDT at
+/// `frame_number`. Returns the number of provers seeded.
+pub fn reset_prover_tree_to_genesis(
+    hypergraph: &Arc<HypergraphCrdt>,
+    rocks_store: &quil_store::RocksHypergraphStore,
+    frame_number: u64,
+    network: u8,
+    genesis_seed: &str,
+    local_prover_pubkey: &[u8],
+) -> Result<usize> {
+    let guard = hypergraph.lock_forest_writes();
+    reset_prover_tree_to_genesis_with_guard(
+        hypergraph,
+        rocks_store,
+        &guard,
+        frame_number,
+        network,
+        genesis_seed,
+        local_prover_pubkey,
+    )
+}
+
+/// Reset through the materializer's bound store while its forest barrier is
+/// already held. The owner must discard a tentative branch if any step fails.
+pub fn reset_prover_tree_to_genesis_with_guard(
+    hypergraph: &Arc<HypergraphCrdt>,
+    store: &dyn quil_types::store::HypergraphStore,
+    guard: &quil_hypergraph::ForestWriteGuard<'_>,
+    frame_number: u64,
+    network: u8,
+    genesis_seed: &str,
+    local_prover_pubkey: &[u8],
+) -> Result<usize> {
+    use quil_types::store::ShardKey;
+    hypergraph.check_forest_guard(guard)?;
+    let identity = hypergraph.backing_store_identity().ok_or_else(|| {
+        QuilError::ExecutionUnavailable("reset requires identifiable storage".into())
+    })?;
+    if store.backing_store_identity().as_ref() != Some(&identity) {
+        return Err(QuilError::ExecutionUnavailable(
+            "prover reset store mismatch".into(),
+        ));
+    }
+    // Reject an invalid configured genesis before clearing any existing state.
+    let genesis_keys = if network == 0 {
+        Vec::new()
+    } else {
+        resolve_testnet_prover_keys(network, genesis_seed, local_prover_pubkey)?
+    };
+    // The global intrinsic prover shard: l2 = 0xff*32 (the id the CRDT commits it
+    // under, `&shard.l2`).
+    let prover_l2 = [0xffu8; 32];
+    let shard = ShardKey {
+        l1: [0u8; 3],
+        l2: prover_l2,
+    };
+
+    // 0. FENCE — committee-session authorization records share this shard. They
+    //    are not prover state: carry them across the wipe byte-for-byte, so a
+    //    managed application keeps its sessions, requests and seals. A failed
+    //    scan aborts the reset rather than silently dropping authorization.
+    let mut authorization: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    hypergraph.for_each_vertex_underlying_shard("vertex", "adds", &shard, &mut |key, blob| {
+        if key.len() == 64 && quil_execution::global_intrinsic::handoff::is_record_blob(&blob) {
+            authorization.push((key[32..].to_vec(), blob));
+        }
+    })?;
+    authorization.sort();
+
+    // 1. WIPE — forest phase trees (vertex adds/removes + hyperedge adds/removes)
+    //    and the underlying blob keyspace, so the rebuild starts from empty and
+    //    nothing (tree node or flat blob) resurrects a dropped record.
+    hypergraph.reset_shard_forest_trees_with_guard(guard, &prover_l2)?;
+    store.clear_shard_underlying(&shard)?;
+
+    // 2. REBUILD via the established genesis seeders (Falcon-keyed, exact addresses).
+    let seeded = if network == 0 {
+        // From-empty, `restore_global_prover_seniority` seeds every genesis prover
+        // (beacon + archives) at `MAINNET_BEACON_SENIORITY`; both this and the
+        // removed-prover kick commit internally.
+        let n = restore_global_prover_seniority(hypergraph, frame_number)?;
+        remove_offline_global_prover(hypergraph, frame_number)?;
+        n
+    } else {
+        let state = HypergraphState::new(hypergraph.clone());
+        for pubkey in &genesis_keys {
+            add_prover_on_filter(&state, pubkey, 1000, frame_number, &[])?;
+        }
+        state.commit()?;
+        hypergraph.commit(frame_number)?;
+        genesis_keys.len()
+    };
+
+    if !authorization.is_empty() {
+        let va_disc = hypergraph_state::vertex_adds_discriminator()?;
+        let state = HypergraphState::new(hypergraph.clone());
+        for (address, blob) in &authorization {
+            state.set(
+                &GLOBAL_INTRINSIC_ADDRESS[..],
+                address,
+                va_disc.as_slice(),
+                frame_number,
+                blob.clone(),
+            )?;
+        }
+        state.commit()?;
+        hypergraph.commit(frame_number)?;
+    }
+
+    info!(
+        seeded,
+        authorization_records = authorization.len(),
+        frame = frame_number,
+        network,
+        "reset_prover_tree_to_genesis: global prover tree wiped + rebuilt from genesis committee"
+    );
+    Ok(seeded)
+}
+
+/// Peer ID of the genesis archive prover being permanently removed from the
+/// global committee (offline; its slot would otherwise keep the committee at
+/// 6 members and its rank turns would always time out). Removing it leaves a
+/// fixed 5-member committee (beacon + 4 archives) with a hard-set 4-of-5
+/// count-based quorum. Its BLS pubkey is resolved from the genesis
+/// `archive_peers` map (keyed by peer ID).
+pub const REMOVED_GLOBAL_PROVER_PEER_ID: &str = "QmaMcbX3NH5d6BXy87C1n2xT68XzCwtkbvMRqdLYphh19b";
+
+/// Deterministically deactivate ([`REMOVED_GLOBAL_PROVER_PEER_ID`]) — the
+/// permanently-offline genesis archive — from the GLOBAL committee, so the
+/// active set (and hence leader rotation + the count-based quorum) is exactly
+/// 5 members. Membership is by ACTIVE global allocation
+/// (`ProverRegistryStore::get_active_provers`), so this sets both the prover
+/// vertex and its empty-filter allocation vertex `Status` to `STATUS_KICKED`,
+/// preserving all other fields.
+///
+/// Like [`restore_global_prover_seniority`] it is deterministic (fixed
+/// address + status byte, no frame-dependent field written to the vertex, so
+/// every archive converges on the identical tree) and idempotent (a no-op
+/// once already kicked). Archive-only at startup; non-archives converge via
+/// hypersync. Returns `true` if it made a change.
+pub fn remove_offline_global_prover(
+    hypergraph: &Arc<HypergraphCrdt>,
+    frame_number: u64,
+) -> Result<bool> {
+    use quil_execution::global_intrinsic::materialize::STATUS_KICKED;
+
+    let genesis_data = get_mainnet_genesis_data()?;
+    let pubkey_hex = match genesis_data
+        .archive_peers
+        .get(REMOVED_GLOBAL_PROVER_PEER_ID)
+    {
+        Some(h) => h,
+        None => {
+            warn!(
+                peer_id = REMOVED_GLOBAL_PROVER_PEER_ID,
+                "remove_offline_global_prover: peer not in genesis archive_peers, nothing to do"
+            );
+            return Ok(false);
+        }
+    };
+    let pubkey = hex::decode(pubkey_hex)
+        .map_err(|e| QuilError::Internal(format!("remove prover: decode archive key: {}", e)))?;
+
+    let va_disc = hypergraph_state::vertex_adds_discriminator()?;
+    let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+    let state = HypergraphState::new(hypergraph.clone());
+
+    let prover_address = materialize::prover_address_from_pubkey(&pubkey)?;
+    // Global allocation lives at the empty-filter allocation address.
+    let alloc_address = materialize::allocation_address(&pubkey, &[])?;
+
+    // Helper: load a vertex, set its Status to Kicked if not already, write
+    // back. Returns whether it changed.
+    let kick_status = |address: &[u8], cls: &str| -> Result<bool> {
+        let Some(blob) = state.get(domain, address, va_disc.as_slice())? else {
+            return Ok(false);
+        };
+        let mut tree = prover_registry::rebuild_vertex_tree_from_blob(&blob);
+        let cur = quil_execution::global_schema::read_field(&tree, cls, "Status");
+        if cur.as_deref() == Some(&[STATUS_KICKED][..]) {
+            return Ok(false);
+        }
+        write_field(&mut tree, cls, "Status", &[STATUS_KICKED])?;
+        state.set(
+            domain,
+            address,
+            va_disc.as_slice(),
+            frame_number,
+            prover_registry::vertex_tree_to_blob(&tree),
+        )?;
+        Ok(true)
+    };
+
+    let mut changed = false;
+    changed |= kick_status(&alloc_address, "allocation:ProverAllocation")?;
+    changed |= kick_status(&prover_address, "prover:Prover")?;
+
+    if changed {
+        state.commit()?;
+        hypergraph.commit(frame_number)?;
+        info!(
+            peer_id = REMOVED_GLOBAL_PROVER_PEER_ID,
+            address = %hex::encode(prover_address),
+            "remove_offline_global_prover: deactivated offline genesis prover (Status=Kicked)"
+        );
+    } else {
+        info!(
+            peer_id = REMOVED_GLOBAL_PROVER_PEER_ID,
+            "remove_offline_global_prover: prover already removed (no-op)"
+        );
+    }
+    Ok(changed)
+}
+
+/// Add a single genesis prover to the hypergraph state. Creates:
+///
+/// - **Prover vertex**: PublicKey, Status=1 (Active), AvailableStorage=0,
+/// Seniority, at `poseidon(pubkey)` within `GLOBAL_INTRINSIC_ADDRESS`.
+///
+/// - **ProverAllocation vertex**: Prover (reference), Status=1 (Active),
+/// ConfirmationFilter=nil (global shard), JoinFrameNumber=0,
+/// JoinConfirmFrameNumber=0, LastActiveFrameNumber=frameNumber,
+/// at `poseidon("PROVER_ALLOCATION" || pubkey || nil)`.
+///
+/// - **Hyperedge** connecting the prover to its allocation, stored at the
+/// prover's data address within the hyperedge adds set.
+fn add_genesis_prover(
+    state: &HypergraphState,
+    pubkey: &[u8],
+    seniority: u64,
+    frame_number: u64,
+) -> Result<()> {
+    // Genesis provers are global-committee members: empty
+    // ConfirmationFilter (global shard allocation).
+    add_prover_on_filter(state, pubkey, seniority, frame_number, &[])
+}
+
+/// Seed an Active prover with an Active allocation on a SPECIFIC shard
+/// `filter`. Generalization of [`add_genesis_prover`] (which uses the
+/// empty/global filter) — see that function's doc for the vertex layout.
+/// When `filter` is empty this is byte-identical to `add_genesis_prover`.
+fn add_prover_on_filter(
+    state: &HypergraphState,
+    pubkey: &[u8],
+    seniority: u64,
+    frame_number: u64,
+    filter: &[u8],
+) -> Result<()> {
+    let va_disc = hypergraph_state::vertex_adds_discriminator()?;
+    let ha_disc = hypergraph_state::hyperedge_adds_discriminator()?;
+    let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+
+    // Compute prover address: poseidon(pubkey) -> 32 bytes
+    let prover_address = materialize::prover_address_from_pubkey(pubkey)?;
+
+    // --- Build Prover vertex tree ---
+    let mut prover_tree = quil_tries::VectorCommitmentTree::new();
+    let prover_cls = "prover:Prover";
+
+    // Type hash at [0xFF; 32]
+    write_type(&mut prover_tree, prover_cls)?;
+
+    // PublicKey (order 0)
+    write_field(&mut prover_tree, prover_cls, "PublicKey", pubkey)?;
+
+    // Status = 1 (Active) — genesis provers start active, not joining
+    write_field(
+        &mut prover_tree,
+        prover_cls,
+        "Status",
+        &[materialize::STATUS_ACTIVE],
+    )?;
+
+    // AvailableStorage = 0
+    write_field(
+        &mut prover_tree,
+        prover_cls,
+        "AvailableStorage",
+        &0u64.to_be_bytes(),
+    )?;
+
+    // Seniority
+    write_field(
+        &mut prover_tree,
+        prover_cls,
+        "Seniority",
+        &seniority.to_be_bytes(),
+    )?;
+
+    // JoinFrameNumber and KickFrameNumber are intentionally not set on
+    // the prover vertex at genesis — only the allocation carries those.
+
+    // Serialize and store prover vertex
+    let prover_blob = prover_registry::vertex_tree_to_blob(&prover_tree);
+    state.set(domain, &prover_address, &va_disc, frame_number, prover_blob)?;
+
+    // --- Build ProverAllocation vertex tree ---
+    let alloc_cls = "allocation:ProverAllocation";
+
+    // Compute allocation address:
+    //   poseidon("PROVER_ALLOCATION" || pubkey || filter)
+    // For genesis the filter is empty, so the concat is just
+    // "PROVER_ALLOCATION" || pubkey.
+    let alloc_address = materialize::allocation_address(pubkey, filter)?;
+
+    let mut alloc_tree = quil_tries::VectorCommitmentTree::new();
+
+    // Type hash
+    write_type(&mut alloc_tree, alloc_cls)?;
+
+    // Prover reference (order 0) — the prover's 32-byte address
+    write_field(&mut alloc_tree, alloc_cls, "Prover", &prover_address)?;
+
+    // Status = 1 (Active)
+    write_field(
+        &mut alloc_tree,
+        alloc_cls,
+        "Status",
+        &[materialize::STATUS_ACTIVE],
+    )?;
+
+    // ConfirmationFilter = the shard filter (empty ⇒ global shard).
+    write_field(&mut alloc_tree, alloc_cls, "ConfirmationFilter", filter)?;
+
+    // JoinFrameNumber = 0
+    write_field(
+        &mut alloc_tree,
+        alloc_cls,
+        "JoinFrameNumber",
+        &0u64.to_be_bytes(),
+    )?;
+
+    // JoinConfirmFrameNumber = 0
+    write_field(
+        &mut alloc_tree,
+        alloc_cls,
+        "JoinConfirmFrameNumber",
+        &0u64.to_be_bytes(),
+    )?;
+
+    // LastActiveFrameNumber = frameNumber
+    write_field(
+        &mut alloc_tree,
+        alloc_cls,
+        "LastActiveFrameNumber",
+        &frame_number.to_be_bytes(),
+    )?;
+
+    // Serialize and store allocation vertex
+    let alloc_blob = prover_registry::vertex_tree_to_blob(&alloc_tree);
+    state.set(domain, &alloc_address, &va_disc, frame_number, alloc_blob)?;
+
+    // --- Build Hyperedge connecting prover to allocation ---
+    //
+    // Hyperedge lives at (GLOBAL_INTRINSIC_ADDRESS, proverAddress); the
+    // allocation atom is added to its extrinsic tree.
+    //
+    // The extrinsic tree stores each atom at key = atom ID
+    // (64 bytes: appAddr || dataAddr) with value = atom bytes
+    // (0x00 || appAddr[32] || dataAddr[32] || commitment[64] || size[32] = 161 bytes).
+
+    // Build the extrinsic tree for the hyperedge.
+    // Key = allocation atom ID (GLOBAL_INTRINSIC_ADDRESS || alloc_address)
+    let mut atom_id = Vec::with_capacity(64);
+    atom_id.extend_from_slice(&GLOBAL_INTRINSIC_ADDRESS);
+    atom_id.extend_from_slice(&alloc_address);
+
+    // Value = atom.ToBytes() = 0x00 || appAddr[32] || dataAddr[32] || commitment[64] || size[32]
+    let alloc_commitment = alloc_tree.commit(&quil_types::crypto::NoopInclusionProver);
+    // Get tree size from root node, or default to zero
+    let alloc_size = alloc_tree
+        .root
+        .as_ref()
+        .map(|node| node.size().clone())
+        .unwrap_or_else(|| BigInt::from(0));
+    let mut alloc_size_bytes = [0u8; 32];
+    let (_, size_bytes) = alloc_size.to_bytes_be();
+    let offset = 32usize.saturating_sub(size_bytes.len());
+    alloc_size_bytes[offset..].copy_from_slice(&size_bytes[..std::cmp::min(size_bytes.len(), 32)]);
+
+    let mut atom_bytes = Vec::with_capacity(161);
+    atom_bytes.push(0x00);
+    atom_bytes.extend_from_slice(&GLOBAL_INTRINSIC_ADDRESS);
+    atom_bytes.extend_from_slice(&alloc_address);
+    atom_bytes.extend_from_slice(&alloc_commitment);
+    atom_bytes.extend_from_slice(&alloc_size_bytes);
+
+    // Build the extrinsic VectorCommitmentTree for the hyperedge
+    let mut ext_tree = quil_tries::VectorCommitmentTree::new();
+    ext_tree.insert(
+        &atom_id,
+        &atom_bytes,
+        &[],
+        &BigInt::from(atom_bytes.len() as u64),
+    )?;
+
+    // Serialize the extrinsic tree as the hyperedge data
+    let hyperedge_blob = prover_registry::vertex_tree_to_blob(&ext_tree);
+    state.set(
+        domain,
+        &prover_address,
+        &ha_disc,
+        frame_number,
+        hyperedge_blob,
+    )?;
+
+    debug!(
+        prover_address = hex::encode(&prover_address),
+        alloc_address = hex::encode(&alloc_address),
+        seniority = seniority,
+        "added genesis prover"
+    );
+
+    Ok(())
+}
+
+/// Test-only seeding helper: register `pubkey` as an Active prover with
+/// an Active allocation on shard `filter` directly into an existing,
+/// already-genesis'd hypergraph, then commit so a subsequent
+/// `SharedProverRegistry::refresh_from_store` observes it.
+///
+/// Used by the tier-2 coverage e2e harness so the archive's prover
+/// registry contains the worker cohort as active provers on their shard.
+/// The FrameHeader aggregate-pubkey verifier reconstructs the committee
+/// from `get_active_provers(filter)`; without these vertices the active
+/// set for the worker shard is empty and verification fails with
+/// "aggregate pubkey ... active_count=0". Producer (worker committee) and
+/// verifier (archive) must derive the committee from the SAME registry so
+/// their member ordering — and thus the signed bitmask — agree.
+pub fn seed_active_prover_on_filter(
+    hypergraph: &Arc<HypergraphCrdt>,
+    pubkey: &[u8],
+    seniority: u64,
+    frame_number: u64,
+    filter: &[u8],
+) -> Result<()> {
+    let state = HypergraphState::new(hypergraph.clone());
+    add_prover_on_filter(&state, pubkey, seniority, frame_number, filter)?;
+    state.commit()?;
+    hypergraph.commit(frame_number)?;
+    Ok(())
+}
+
+// =========================================================================
+// Testnet / devnet genesis
+// =========================================================================
+
+/// Default difficulty for testnet/devnet genesis when none is specified.
+const DEFAULT_TESTNET_DIFFICULTY: u32 = 10000;
+
+/// Initialize genesis state for a testnet or devnet network.
+///
+/// Unlike the mainnet path, this creates a fresh genesis at frame 0 with:
+/// - Empty parent selector (32 zero bytes)
+/// - Current wall-clock timestamp
+/// - Empty VDF output (516 zero bytes)
+/// - Prover reward vertices in the QUIL token domain
+/// - Provers seeded with seniority 1000
+///
+/// The `genesis_seed` parameter (hex-encoded) supplies one or more 585-byte
+/// BLS48-581 public keys. When empty or when `network == 99`,
+/// `local_bls_pubkey` is used as the sole prover instead.
+pub fn initialize_testnet_genesis_state(
+    network: u8,
+    genesis_seed: &str,
+    local_bls_pubkey: &[u8],
+    difficulty: u32,
+    clock_store: &dyn ClockStore,
+    shards_store: &dyn quil_types::store::ShardsStore,
+    hypergraph: &Arc<HypergraphCrdt>,
+    inclusion_prover: &(dyn quil_types::crypto::InclusionProver + Sync),
+) -> Result<(global::GlobalFrame, global::QuorumCertificate)> {
+    info!(
+        network = network,
+        "initializing testnet/devnet genesis frame"
+    );
+
+    // 1. Check if genesis already exists at frame 0
+    if let Ok(existing) = clock_store.get_global_clock_frame(0) {
+        if existing.header.is_some() {
+            info!("testnet genesis frame already exists in clock store");
+            let qc = clock_store
+                .get_latest_quorum_certificate(&[])
+                .unwrap_or_else(|_| make_genesis_qc(&existing));
+            return Ok((existing, qc));
+        }
+    }
+
+    // 2. Determine prover keys
+    let prover_pubkeys = resolve_testnet_prover_keys(network, genesis_seed, local_bls_pubkey)?;
+    if prover_pubkeys.is_empty() {
+        return Err(QuilError::Internal(
+            "no prover keys available for testnet genesis".into(),
+        ));
+    }
+
+    // 3. Create reward vertices in the QUIL token domain
+    establish_testnet_reward_vertices(&prover_pubkeys, hypergraph)?;
+
+    // 4. Create prover + allocation vertices (seniority=1000, frame=0)
+    let state = HypergraphState::new(hypergraph.clone());
+    for pubkey in &prover_pubkeys {
+        add_genesis_prover(&state, pubkey, 1000, 0)?;
+    }
+
+    // Seed the QUIL_TOKEN domain with six placeholder vertices and
+    // write six app-shard records keyed by
+    // `(QUIL_TOKEN_ADDRESS, path=0..5)`. Without these the testnet has
+    // no app shards in `shards_store`, so a non-global prover joining
+    // the network has nothing to propose joining —
+    // `build_proposal_descriptors` only sees the global filter (which
+    // it explicitly filters out).
+    let quil_token_domain = quil_execution::domains::QUIL_TOKEN;
+    let va_disc = hypergraph_state::vertex_adds_discriminator()?;
+    for i in 0u8..6 {
+        let mut address = [0u8; 32];
+        address[0] = i;
+        // 64-byte zero blob is the placeholder payload.
+        state.set(&quil_token_domain[..], &address, &va_disc, 0, vec![0u8; 64])?;
+    }
+
+    // DEV-ONLY (gated): seed real transparent QUIL coins to a predefined
+    // recipient so the QUIL shard has DATA for provers to replicate + attest.
+    // Storage attestation proves PROVEN STORAGE of shard data; an empty shard
+    // proves nothing and earns nothing (correct PoRep). These coins are the same
+    // shape `--migrate-db` writes (`create_transparent_coin_tree`), just seeded
+    // directly at genesis. Their content addresses hash-spread across all 64 QUIL
+    // sub-shards, so whichever the local workers cover gets coins. All nodes seed
+    // identically (same env) → identical genesis root. NEVER runs unless the env
+    // var is set, so mainnet genesis is untouched.
+    if std::env::var("QUIL_SEED_SHARD_DATA").is_ok() {
+        use quil_execution::token_intrinsic::legacy_migration::{
+            create_transparent_coin_tree, transparent_type_hash, TransparentCoin,
+        };
+        let th = transparent_type_hash(&quil_token_domain[..])?;
+        let recipient = [0x11u8; 32];
+        let mut seeded = 0u32;
+        for i in 0u32..256 {
+            let coin = TransparentCoin {
+                owner_address: recipient,
+                amount: 1_000_000_000u128,
+            };
+            // `origin` makes each coin's content address distinct (uniqueness leaf).
+            let mut origin = [0u8; 32];
+            origin[..4].copy_from_slice(&i.to_le_bytes());
+            origin[4] = 0x51; // 'Q'
+            let tree = create_transparent_coin_tree(&coin, &th, &origin)?;
+            let addr = quil_execution::token_intrinsic::materialize::coin_content_address(&tree)?;
+            let ser = quil_tries::serialize_go_tree(tree.root.as_ref())
+                .map_err(|e| QuilError::Internal(format!("seed coin serialize: {e}")))?;
+            state.set(&quil_token_domain[..], &addr, &va_disc, 0, ser)?;
+            seeded += 1;
+        }
+        tracing::warn!(
+            seeded,
+            recipient = %hex::encode(recipient),
+            "QUIL_SEED_SHARD_DATA: seeded transparent QUIL coins into the QUIL shard (dev-only)"
+        );
+    }
+
+    state.commit()?;
+
+    // 5. Commit hypergraph and extract roots
+    let roots = hypergraph.commit(0)?;
+
+    // Persist the six QUIL token app-shard records to the shards
+    // store. The shards-store entries are what the worker allocator
+    // iterates via `range_app_shards` to discover available shards
+    // — they're the source of truth for "what shards exist", separate
+    // from the prover registry's view of "who is allocated where".
+    //
+    // `shard_key` layout: a 3-byte bloom filter index (L1) followed
+    // by the 32-byte address (L2). The shards-store reader hardcodes
+    // a 35-byte shard_key length, so writing a bare 32-byte L2 here
+    // causes 3 bytes of the encoded prefix u32 to be folded into the
+    // shard_key on readback.
+    let l1 = quil_hypergraph::addressing::get_bloom_filter_indices(&quil_token_domain[..], 256, 3);
+    let mut quil_shard_key = Vec::with_capacity(3 + quil_token_domain.len());
+    quil_shard_key.extend_from_slice(&l1);
+    quil_shard_key.extend_from_slice(&quil_token_domain[..]);
+    {
+        // QUIL is a SINGLE shard at genesis (empty prefix = the whole app) and
+        // splits DYNAMICALLY like every other app as it grows — no fixed
+        // pre-split grid on testnet/devnet. (Mainnet keeps the fixed 64-way grid
+        // via `normalize_quil_token_grid` + `install_forest_boot`.)
+        let txn = clock_store.new_transaction(false)?;
+        shards_store.put_app_shard(
+            txn.as_ref(),
+            &quil_types::store::ShardInfo {
+                shard_key: quil_shard_key.clone(),
+                prefix: vec![],
+                size: Vec::new(),
+                data_shards: 0,
+                commitment: Vec::new(),
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    // Build 256 commitment trees from all shard roots
+    let mut commitment_trees: Vec<quil_tries::VectorCommitmentTree> = (0..256)
+        .map(|_| quil_tries::VectorCommitmentTree::new())
+        .collect();
+
+    for (shard_key, commits) in &roots {
+        if commits.is_empty() {
+            continue;
+        }
+        for i in 0..3 {
+            let idx = shard_key.l1[i] as usize;
+            if idx < 256 {
+                commitment_trees[idx].insert(
+                    &shard_key.l2,
+                    &commits[0],
+                    &[],
+                    &BigInt::from(commits[0].len() as u64),
+                )?;
+                commitment_trees[idx].commit(inclusion_prover);
+            }
+        }
+    }
+
+    // Extract prover tree commitment
+    let global_shard_key = ShardKey {
+        l1: [0u8; 3],
+        l2: GLOBAL_INTRINSIC_ADDRESS,
+    };
+    let prover_root = match roots.get(&global_shard_key) {
+        Some(shard_roots) if !shard_roots.is_empty() => shard_roots[0].clone(),
+        _ => {
+            warn!("no prover tree roots after testnet commit, using empty root");
+            vec![0u8; 64]
+        }
+    };
+
+    // 6. Build the stub genesis frame
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let effective_difficulty = if difficulty > 0 {
+        difficulty
+    } else {
+        DEFAULT_TESTNET_DIFFICULTY
+    };
+
+    let mut global_commitments: Vec<Vec<u8>> = Vec::with_capacity(256);
+    for i in 0..256 {
+        global_commitments.push(commitment_trees[i].commit(inclusion_prover));
+    }
+
+    let header = global::GlobalFrameHeader {
+        frame_number: 0,
+        parent_selector: vec![0u8; 32],
+        timestamp: now_ms,
+        difficulty: effective_difficulty,
+        output: vec![0u8; 516],
+        prover: Vec::new(),
+        prover_tree_commitment: prover_root,
+        requests_root: Vec::new(),
+        global_commitments,
+        public_key_signature_bls48581: Some(keys::Bls48581AggregateSignature {
+            signature: Vec::new(),
+            public_key: Some(keys::Bls48581g2PublicKey {
+                key_value: Vec::new(),
+            }),
+            bitmask: Vec::new(),
+        }),
+        ..Default::default()
+    };
+
+    let genesis_frame = global::GlobalFrame {
+        header: Some(header),
+        requests: Vec::new(),
+    };
+
+    // 7. Store frame + QC
+    let txn = clock_store.new_transaction(false)?;
+    clock_store.put_global_clock_frame(&genesis_frame, txn.as_ref())?;
+    let genesis_qc = make_genesis_qc(&genesis_frame);
+    clock_store.put_quorum_certificate(&genesis_qc, txn.as_ref())?;
+    txn.commit()?;
+
+    info!("initialized testnet/devnet genesis frame");
+    Ok((genesis_frame, genesis_qc))
+}
+
+/// Resolve the set of BLS public keys to use for testnet genesis provers.
+///
+/// - If `genesis_seed` is non-empty and `network != 99`: hex-decode the seed
+/// and split into 585-byte BLS48-581 public keys.
+/// - Otherwise: use `local_bls_pubkey` as the single prover.
+pub fn resolve_testnet_prover_keys(
+    network: u8,
+    genesis_seed: &str,
+    local_bls_pubkey: &[u8],
+) -> Result<Vec<Vec<u8>>> {
+    if network != 99 && !genesis_seed.is_empty() {
+        let stripped: String = genesis_seed.split_whitespace().collect();
+        let seed_bytes = hex::decode(&stripped).map_err(|e| {
+            QuilError::Internal(format!("failed to decode genesis seed hex: {}", e))
+        })?;
+        if seed_bytes.len() % 897 != 0 {
+            return Err(QuilError::Internal(format!(
+                "invalid genesis seed length {}: must be a multiple of 897 bytes",
+                seed_bytes.len()
+            )));
+        }
+        let count = seed_bytes.len() / 897;
+        let mut keys = Vec::with_capacity(count);
+        for i in 0..count {
+            keys.push(seed_bytes[i * 897..(i + 1) * 897].to_vec());
+        }
+        debug!(
+            count = count,
+            "resolved testnet prover keys from genesis seed"
+        );
+        Ok(keys)
+    } else {
+        debug!("using local BLS pubkey as sole testnet prover");
+        Ok(vec![local_bls_pubkey.to_vec()])
+    }
+}
+
+/// Create ProverReward vertices in the QUIL token domain for each prover.
+/// Each prover gets:
+/// - A reward vertex at `poseidon(QUIL_TOKEN_ADDRESS || prover_address)`
+/// within the QUIL_TOKEN domain
+/// - DelegateAddress set to the reward address itself
+/// - Balance set to 10000 * 8_000_000_000 (10000 QUIL)
+fn establish_testnet_reward_vertices(
+    prover_pubkeys: &[Vec<u8>],
+    hypergraph: &Arc<HypergraphCrdt>,
+) -> Result<()> {
+    let va_disc = hypergraph_state::vertex_adds_discriminator()?;
+    let quil_token_domain = &quil_execution::domains::QUIL_TOKEN[..];
+
+    let state = HypergraphState::new(hypergraph.clone());
+
+    for pubkey in prover_pubkeys {
+        let prover_address = materialize::prover_address_from_pubkey(pubkey)?;
+        let reward_addr = materialize::reward_address(&prover_address)?;
+
+        // Build ProverReward vertex tree
+        let mut reward_tree = quil_tries::VectorCommitmentTree::new();
+        let reward_cls = "reward:ProverReward";
+
+        write_type(&mut reward_tree, reward_cls)?;
+
+        // DelegateAddress (order 0) — set to the reward address itself
+        write_field(
+            &mut reward_tree,
+            reward_cls,
+            "DelegateAddress",
+            &reward_addr,
+        )?;
+
+        // Balance (order 1) — 10000 QUIL = 10000 * 8_000_000_000
+        let balance = 10_000u64 * quil_execution::token_intrinsic::constants::QUIL_TOKEN_UNITS;
+        let mut balance_bytes = [0u8; 32];
+        let balance_be = balance.to_be_bytes();
+        balance_bytes[32 - balance_be.len()..].copy_from_slice(&balance_be);
+        write_field(&mut reward_tree, reward_cls, "Balance", &balance_bytes)?;
+
+        // Serialize and store reward vertex
+        let reward_blob = prover_registry::vertex_tree_to_blob(&reward_tree);
+        state.set(quil_token_domain, &reward_addr, &va_disc, 0, reward_blob)?;
+
+        debug!(
+            prover_address = hex::encode(&prover_address),
+            reward_address = hex::encode(&reward_addr),
+            "created testnet reward vertex"
+        );
+    }
+
+    state.commit()?;
+    Ok(())
+}
+
+// =========================================================================
+// Unified genesis entry point
+// =========================================================================
+
+/// Initialize genesis state, dispatching to the appropriate path based on
+/// the network identifier.
+///
+/// - `network == 0` (mainnet): Loads the embedded mainnet genesis JSON and
+/// seeds provers from the archive peer list.
+/// - Any other value (testnet/devnet): Creates a stub genesis at frame 0
+/// with provers derived from `genesis_seed` or `local_bls_pubkey`.
+pub fn initialize_genesis(
+    network: u8,
+    genesis_seed: &str,
+    local_bls_pubkey: &[u8],
+    difficulty: u32,
+    clock_store: &dyn ClockStore,
+    shards_store: &dyn ShardsStore,
+    hypergraph: &Arc<HypergraphCrdt>,
+    inclusion_prover: &(dyn quil_types::crypto::InclusionProver + Sync),
+) -> Result<(global::GlobalFrame, global::QuorumCertificate)> {
+    if network == 0 {
+        initialize_genesis_state(clock_store, shards_store, hypergraph, inclusion_prover)
+    } else {
+        initialize_testnet_genesis_state(
+            network,
+            genesis_seed,
+            local_bls_pubkey,
+            difficulty,
+            clock_store,
+            shards_store,
+            hypergraph,
+            inclusion_prover,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every mainnet bootstrap peer id MUST equal a genesis archive's DERIVED
+    /// Falcon peer id (`peer_id_from_falcon_pubkey`, what the archive actually
+    /// presents on the wire) — otherwise libp2p rejects the dial on peer-id
+    /// mismatch and the node never joins the mesh (the exact bug this fixed).
+    /// Compared as SETS since `genesis_archive_peers()` order is map-derived.
+    #[test]
+    fn mainnet_bootstrap_peer_ids_are_the_derived_falcon_archive_ids() {
+        use std::collections::BTreeSet;
+        let derived: BTreeSet<String> = genesis_archive_peers()
+            .unwrap()
+            .into_iter()
+            .map(|(pid, _)| pid)
+            .collect();
+        let boot: BTreeSet<String> = quil_config::MAINNET_BOOTSTRAP_PEERS
+            .iter()
+            .map(|ma| ma.rsplit("/p2p/").next().unwrap().to_string())
+            .collect();
+        let decommissioned: BTreeSet<String> = quil_config::DECOMMISSIONED_GENESIS_ARCHIVES
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        assert_eq!(derived.len(), 5, "expected 5 genesis archives");
+        assert!(
+            boot.is_disjoint(&decommissioned),
+            "a decommissioned archive must not be dialed"
+        );
+        assert_eq!(
+            boot.union(&decommissioned).cloned().collect::<BTreeSet<_>>(),
+            derived,
+            "bootstrap peer IDs must be exactly the derived Falcon archive IDs the live archives present"
+        );
+    }
+
+    /// The flag-day prover-tree reset wipes the whole global prover shard;
+    /// committee-session authorization shares that shard and must survive it.
+    #[test]
+    fn prover_tree_reset_carries_committee_authorization_across_the_wipe() {
+        use quil_execution::global_intrinsic::handoff;
+        use quil_types::crypto::Signer as _;
+        let db = quil_store::RocksDb::open_in_memory().unwrap();
+        let store = Arc::new(quil_store::RocksHypergraphStore::new(db.inner()));
+        let crdt = Arc::new(HypergraphCrdt::new(
+            store.clone(),
+            Arc::new(quil_hypergraph::testing::StubProver),
+        ));
+        crdt.set_forest(quil_forest::Forest::with_namespace(
+            db.inner(),
+            quil_store::FOREST_NAMESPACE,
+        ));
+        let signers: Vec<_> = (0..2)
+            .map(|_| quil_crypto::FalconSigner::generate())
+            .collect();
+        let mut members: Vec<Vec<u8>> = signers.iter().map(|s| s.public_key().to_vec()).collect();
+        members.sort();
+        let session = quil_cw_consensus::handoff::Session {
+            chain_id: [7; 32],
+            filter: vec![0x61; 32],
+            generation: 1,
+            genesis: quil_crypto::poseidon::hash_bytes_to_32(&[0; 32]).unwrap(),
+            base_frame: 0,
+            authorization: [0; 32],
+            members: members.clone(),
+        };
+        let cursor = quil_store::encoding::global_materialized_cursor_key();
+        let state = HypergraphState::new(crdt.clone());
+        // A prover that is NOT in the genesis set: the reset must drop it.
+        add_prover_on_filter(&state, &members[1], 5, 1, &[]).unwrap();
+        handoff::initialize(&state, 1, &session).unwrap();
+        state.commit().unwrap();
+        state.abort();
+        crdt.commit_with_global_cursor(1, &cursor).unwrap();
+
+        let seed = hex::encode(&members[0]);
+        assert_eq!(
+            reset_prover_tree_to_genesis(&crdt, &store, 2, 1, &seed, &[]).unwrap(),
+            1
+        );
+        crdt.commit_with_global_cursor(2, &cursor).unwrap();
+
+        let view = handoff::CommittedView::capture(&crdt).unwrap();
+        assert_eq!(
+            handoff::head(&view, &session.filter).unwrap(),
+            Some(session.clone())
+        );
+        assert_eq!(
+            handoff::status(&view, &session.id().unwrap()).unwrap(),
+            handoff::Status::Active
+        );
+        assert!(handoff::manages_application(&view, &session.filter).unwrap());
+        let scan = quil_execution::prover_registry::CommittedProverScan::try_scan(&crdt).unwrap();
+        let dropped =
+            quil_execution::global_intrinsic::materialize::prover_address_from_pubkey(&members[1])
+                .unwrap();
+        let kept =
+            quil_execution::global_intrinsic::materialize::prover_address_from_pubkey(&members[0])
+                .unwrap();
+        let active: Vec<_> = scan
+            .active_on_filter(&[], 2)
+            .into_iter()
+            .map(|(_, address)| address)
+            .collect();
+        assert!(active.contains(&kept.to_vec()) && !active.contains(&dropped.to_vec()));
+    }
+
+    #[test]
+    fn parse_mainnet_genesis() {
+        let data = get_mainnet_genesis_data().unwrap();
+        assert_eq!(data.frame_number, 244200);
+        assert_eq!(data.timestamp, 1744726759481);
+        assert_eq!(data.difficulty, 160000);
+        assert_eq!(data.archive_peers.len(), 5);
+        assert_eq!(data.initial_commitments.len(), 1);
+    }
+
+    /// The 5 genesis archives carry Falcon prover keys; their network peer-id is
+    /// derived from that key and their prover address = poseidon(key). Pins both
+    /// against the operator-provided values so a bad paste is caught.
+    #[test]
+    fn genesis_archive_peers_are_falcon_with_expected_addresses() {
+        use std::collections::HashSet;
+        let expected: HashSet<&str> = [
+            "130d5a40665d051077671ec4be7989de7a0fb50c66622e43acaf1a23c4270c72",
+            "20891b99a2ec66f03f6dedc864d73c97307d3c2b548d40a5b7e87c6fa734faaf",
+            "1ce97148694de6e8b5469bf446ed9698e258c1f54936f02c15d49c53f73ad810",
+            "2a852ad433bfb63b0f00ce053f01d047c084687240be5659279668d0144fe9ff",
+            "061846da173daf0b5aad8cab107153529fe1387dea5b51d2535982213003e3f3",
+        ]
+        .into_iter()
+        .collect();
+        let peers = genesis_archive_peers().unwrap();
+        assert_eq!(peers.len(), 5);
+        let mut got_addrs = HashSet::new();
+        for (peer_id, pubkey) in &peers {
+            assert_eq!(pubkey.len(), 897, "archive prover key must be Falcon-512");
+            // The returned peer-id is the Falcon-derived network id.
+            assert_eq!(
+                peer_id,
+                &bs58::encode(quil_p2p::peer_id_from_falcon_pubkey(pubkey)).into_string()
+            );
+            let addr =
+                quil_execution::global_intrinsic::materialize::prover_address_from_pubkey(pubkey)
+                    .unwrap();
+            got_addrs.insert(hex::encode(addr));
+        }
+        for a in got_addrs.iter() {
+            assert!(
+                expected.contains(a.as_str()),
+                "unexpected prover address {a}"
+            );
+        }
+        assert_eq!(got_addrs.len(), 5, "expected 5 distinct archive addresses");
+
+        // The beacon (header.prover + first genesis prover) is an
+        // archive's Falcon key → address 130d5a40…
+        let data = get_mainnet_genesis_data().unwrap();
+        let beacon_key = base64::engine::general_purpose::STANDARD
+            .decode(&data.beacon_bls48581_key)
+            .unwrap();
+        assert_eq!(beacon_key.len(), 897, "beacon key must be Falcon-512");
+        let beacon_addr =
+            quil_execution::global_intrinsic::materialize::prover_address_from_pubkey(&beacon_key)
+                .unwrap();
+        assert_eq!(
+            hex::encode(beacon_addr),
+            "130d5a40665d051077671ec4be7989de7a0fb50c66622e43acaf1a23c4270c72"
+        );
+    }
+
+    #[test]
+    fn build_genesis_frame_from_json() {
+        let data = get_mainnet_genesis_data().unwrap();
+        let frame = build_genesis_frame(&data).unwrap();
+        let h = frame.header.as_ref().unwrap();
+        assert_eq!(h.frame_number, 244200);
+        assert_eq!(h.timestamp, 1744726759481);
+        assert_eq!(h.difficulty, 160000);
+        assert_eq!(h.output.len(), 516);
+        assert_eq!(h.parent_selector.len(), 32);
+        assert!(h.prover.len() > 0);
+    }
+
+    #[test]
+    fn load_mainnet_genesis_convenience() {
+        let frame = load_mainnet_genesis().unwrap();
+        assert_eq!(frame.header.as_ref().unwrap().frame_number, 244200);
+    }
+
+    #[test]
+    fn expected_genesis_frame_number_mainnet() {
+        assert_eq!(expected_genesis_frame_number(0), 244200);
+    }
+
+    #[test]
+    fn expected_genesis_frame_number_testnet() {
+        assert_eq!(expected_genesis_frame_number(1), 0);
+    }
+
+    #[test]
+    fn the_successor_committee_is_the_genesis_archives_less_the_decommissioned() {
+        let genesis = genesis_archive_peers().unwrap();
+        let successor = genesis_archive_successor_peers().unwrap();
+        assert_eq!(successor.len(), 4);
+        assert!(successor.iter().all(|peer| genesis.contains(peer)));
+        assert!(!successor
+            .iter()
+            .any(|(peer_id, _)| peer_id == "QmQfp3dpBdX48o1P2HxDLQNtoEJaXvSKejSDBUyxewsHRr"));
+    }
+
+    #[test]
+    fn genesis_archive_peers_returns_five() {
+        let peers = genesis_archive_peers().unwrap();
+        assert_eq!(peers.len(), 5);
+        for (peer_id, pubkey) in &peers {
+            assert!(peer_id.starts_with("Qm"), "expected multibase peer ID");
+            assert!(pubkey.len() > 100, "BLS pubkey should be > 100 bytes");
+        }
+    }
+
+    #[test]
+    fn verify_genesis_frame_matches() {
+        let frame = load_mainnet_genesis().unwrap();
+        assert!(verify_genesis_frame(&frame).unwrap());
+    }
+
+    #[test]
+    fn verify_genesis_frame_wrong_number_fails() {
+        let mut frame = load_mainnet_genesis().unwrap();
+        frame.header.as_mut().unwrap().frame_number = 999;
+        assert!(!verify_genesis_frame(&frame).unwrap());
+    }
+
+    // -----------------------------------------------------------------
+    // Prover seeding tests (using in-memory CRDT)
+    // -----------------------------------------------------------------
+
+    use quil_hypergraph::testing::MemStore;
+    use quil_types::crypto::NoopInclusionProver;
+
+    fn test_crdt() -> Arc<HypergraphCrdt> {
+        Arc::new(HypergraphCrdt::new(
+            Arc::new(MemStore::new()),
+            Arc::new(NoopInclusionProver),
+        ))
+    }
+
+    #[test]
+    fn add_genesis_prover_creates_vertices() {
+        let crdt = test_crdt();
+        let state = HypergraphState::new(crdt.clone());
+
+        let pubkey = vec![0xAAu8; 585]; // dummy BLS key
+        add_genesis_prover(&state, &pubkey, 1000, 244200).unwrap();
+        state.commit().unwrap();
+
+        // Verify prover vertex exists in CRDT
+        let prover_address = materialize::prover_address_from_pubkey(&pubkey).unwrap();
+        let loc = quil_hypergraph::addressing::Location {
+            app_address: GLOBAL_INTRINSIC_ADDRESS,
+            data_address: prover_address,
+        };
+        assert!(crdt.lookup_vertex(&loc), "prover vertex should exist");
+
+        // Verify allocation vertex exists
+        let alloc_address = materialize::allocation_address(&pubkey, &[]).unwrap();
+        let alloc_loc = quil_hypergraph::addressing::Location {
+            app_address: GLOBAL_INTRINSIC_ADDRESS,
+            data_address: alloc_address,
+        };
+        assert!(
+            crdt.lookup_vertex(&alloc_loc),
+            "allocation vertex should exist"
+        );
+
+        // Verify hyperedge exists
+        assert!(
+            crdt.lookup_hyperedge(&loc),
+            "hyperedge should exist at prover address"
+        );
+    }
+
+    #[test]
+    fn add_genesis_prover_sets_correct_fields() {
+        let crdt = test_crdt();
+        let state = HypergraphState::new(crdt.clone());
+
+        let pubkey = vec![0xBBu8; 585];
+        let seniority = 5000u64;
+        let frame_number = 244200u64;
+
+        add_genesis_prover(&state, &pubkey, seniority, frame_number).unwrap();
+        state.commit().unwrap();
+
+        // Read prover vertex data from CRDT
+        let prover_address = materialize::prover_address_from_pubkey(&pubkey).unwrap();
+        let loc = quil_hypergraph::addressing::Location {
+            app_address: GLOBAL_INTRINSIC_ADDRESS,
+            data_address: prover_address,
+        };
+        let prover_data = crdt
+            .get_vertex_data(&loc)
+            .expect("prover data should exist");
+
+        let prover_tree = prover_registry::rebuild_vertex_tree_from_blob(&prover_data);
+        let cls = "prover:Prover";
+
+        // Verify PublicKey
+        assert_eq!(
+            quil_execution::global_schema::read_field(&prover_tree, cls, "PublicKey"),
+            Some(pubkey.clone()),
+        );
+        // Verify Status = 1 (Active)
+        assert_eq!(
+            quil_execution::global_schema::read_field(&prover_tree, cls, "Status"),
+            Some(vec![1]),
+        );
+        // Verify AvailableStorage = 0
+        assert_eq!(
+            quil_execution::global_schema::read_field(&prover_tree, cls, "AvailableStorage"),
+            Some(0u64.to_be_bytes().to_vec()),
+        );
+        // Verify Seniority
+        assert_eq!(
+            quil_execution::global_schema::read_field(&prover_tree, cls, "Seniority"),
+            Some(seniority.to_be_bytes().to_vec()),
+        );
+        // Verify type hash
+        assert_eq!(
+            quil_execution::global_schema::read_type(&prover_tree),
+            Some("prover:Prover"),
+        );
+    }
+
+    #[test]
+    fn add_genesis_prover_sets_allocation_fields() {
+        let crdt = test_crdt();
+        let state = HypergraphState::new(crdt.clone());
+
+        let pubkey = vec![0xCCu8; 585];
+        let frame_number = 244200u64;
+
+        add_genesis_prover(&state, &pubkey, 1000, frame_number).unwrap();
+        state.commit().unwrap();
+
+        // Read allocation vertex data
+        let alloc_address = materialize::allocation_address(&pubkey, &[]).unwrap();
+        let alloc_loc = quil_hypergraph::addressing::Location {
+            app_address: GLOBAL_INTRINSIC_ADDRESS,
+            data_address: alloc_address,
+        };
+        let alloc_data = crdt
+            .get_vertex_data(&alloc_loc)
+            .expect("allocation data should exist");
+
+        let alloc_tree = prover_registry::rebuild_vertex_tree_from_blob(&alloc_data);
+        let cls = "allocation:ProverAllocation";
+
+        // Verify type hash
+        assert_eq!(
+            quil_execution::global_schema::read_type(&alloc_tree),
+            Some("allocation:ProverAllocation"),
+        );
+
+        // Verify Prover reference
+        let prover_address = materialize::prover_address_from_pubkey(&pubkey).unwrap();
+        assert_eq!(
+            quil_execution::global_schema::read_field(&alloc_tree, cls, "Prover"),
+            Some(prover_address.to_vec()),
+        );
+
+        // Verify Status = 1 (Active)
+        assert_eq!(
+            quil_execution::global_schema::read_field(&alloc_tree, cls, "Status"),
+            Some(vec![1]),
+        );
+
+        // Verify ConfirmationFilter = empty (global shard)
+        assert_eq!(
+            quil_execution::global_schema::read_field(&alloc_tree, cls, "ConfirmationFilter"),
+            Some(vec![]),
+        );
+
+        // Verify JoinFrameNumber = 0
+        assert_eq!(
+            quil_execution::global_schema::read_field(&alloc_tree, cls, "JoinFrameNumber"),
+            Some(0u64.to_be_bytes().to_vec()),
+        );
+
+        // Verify JoinConfirmFrameNumber = 0
+        assert_eq!(
+            quil_execution::global_schema::read_field(&alloc_tree, cls, "JoinConfirmFrameNumber"),
+            Some(0u64.to_be_bytes().to_vec()),
+        );
+
+        // Verify LastActiveFrameNumber = frame_number
+        assert_eq!(
+            quil_execution::global_schema::read_field(&alloc_tree, cls, "LastActiveFrameNumber"),
+            Some(frame_number.to_be_bytes().to_vec()),
+        );
+    }
+
+    /// Deterministic verification of MAINNET_BEACON_SENIORITY against
+    /// the canonical compat table. Computes the beacon peer ID from
+    /// the Ed448 key in mainnet_genesis.json and runs it through
+    /// `seniority_compat::get_aggregated_seniority`.
+    ///
+    /// If this assertion ever fails, MAINNET_BEACON_SENIORITY was
+    /// wrong and the genesis prover tree commitment would diverge
+    /// from the canonical one, making the node unable to join mainnet.
+    #[test]
+    fn mainnet_beacon_seniority_matches_compat_table() {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let genesis = get_mainnet_genesis_data().unwrap();
+
+        // Beacon Ed448 key is a 57-byte public key (not a 114-byte
+        // priv+pub pair), so we derive the peer ID directly from it
+        // via the same path quil_p2p uses.
+        let ed448_pub = b64
+            .decode(&genesis.beacon_ed448_key)
+            .expect("beacon Ed448 key not valid base64");
+        assert_eq!(
+            ed448_pub.len(),
+            57,
+            "beacon_ed448_key is {}B, expected 57B Ed448 pubkey",
+            ed448_pub.len()
+        );
+
+        let peer_id_bytes = quil_p2p::ed448_identity::peer_id_from_ed448_pubkey(&ed448_pub);
+        let peer_id_str = bs58::encode(&peer_id_bytes).into_string();
+
+        let computed =
+            quil_execution::seniority_compat::get_aggregated_seniority(&[peer_id_str.clone()]);
+
+        assert_eq!(
+            computed, MAINNET_BEACON_SENIORITY,
+            "MAINNET_BEACON_SENIORITY ({}) does not match compat table result ({}) \
+             for beacon peer {}. Either the constant is wrong or the compat \
+             table (crates/quil-execution/src/seniority_compat.rs) is broken. \
+             Fix one or the other — genesis frame commitment depends on this value.",
+            MAINNET_BEACON_SENIORITY, computed, peer_id_str
+        );
+    }
+
+    #[test]
+    fn establish_mainnet_genesis_provers_creates_six_provers() {
+        let crdt = test_crdt();
+        let state = HypergraphState::new(crdt.clone());
+        let genesis_data = get_mainnet_genesis_data().unwrap();
+
+        establish_mainnet_genesis_provers(&state, &genesis_data).unwrap();
+        state.commit().unwrap();
+
+        // Should have 1 beacon + 5 archive = 6 provers
+        // Each prover creates 2 vertices (prover + allocation) + 1 hyperedge
+        // = 12 vertices + 6 hyperedges
+        //
+        // Verify beacon prover exists
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let beacon_key = b64.decode(&genesis_data.beacon_bls48581_key).unwrap();
+        let beacon_addr = materialize::prover_address_from_pubkey(&beacon_key).unwrap();
+        let beacon_loc = quil_hypergraph::addressing::Location {
+            app_address: GLOBAL_INTRINSIC_ADDRESS,
+            data_address: beacon_addr,
+        };
+        assert!(
+            crdt.lookup_vertex(&beacon_loc),
+            "beacon prover should exist"
+        );
+
+        // Verify each archive peer exists
+        for (_peer_id, pubkey_hex) in &genesis_data.archive_peers {
+            let pubkey = hex::decode(pubkey_hex).unwrap();
+            let addr = materialize::prover_address_from_pubkey(&pubkey).unwrap();
+            let loc = quil_hypergraph::addressing::Location {
+                app_address: GLOBAL_INTRINSIC_ADDRESS,
+                data_address: addr,
+            };
+            assert!(crdt.lookup_vertex(&loc), "archive prover should exist");
+        }
+    }
+
+    #[test]
+    fn make_genesis_qc_fields() {
+        let frame = load_mainnet_genesis().unwrap();
+        let qc = make_genesis_qc(&frame);
+
+        assert_eq!(qc.rank, 0);
+        assert_eq!(qc.filter, Vec::<u8>::new());
+        assert_eq!(qc.frame_number, 244200);
+        assert_eq!(qc.selector.len(), 32);
+        assert_eq!(qc.timestamp, 0);
+
+        let agg = qc.aggregate_signature.as_ref().unwrap();
+        assert_eq!(agg.signature.len(), 74);
+        assert_eq!(agg.public_key.as_ref().unwrap().key_value.len(), 585);
+        assert_eq!(agg.bitmask, vec![0xFFu8; 32]);
+    }
+
+    // -----------------------------------------------------------------
+    // Testnet genesis tests
+    // -----------------------------------------------------------------
+
+    /// Minimal no-op ShardsStore stub for testnet-genesis tests. The
+    /// actual put/range behavior is exercised by integration tests
+    /// against `RocksShardsStore`; here we just need a writable
+    /// destination.
+    struct StubShardsStore;
+    impl ShardsStore for StubShardsStore {
+        fn range_app_shards(&self) -> quil_types::error::Result<Vec<quil_types::store::ShardInfo>> {
+            Ok(vec![])
+        }
+        fn get_app_shards(
+            &self,
+            _: &[u8],
+            _: &[u32],
+        ) -> quil_types::error::Result<Vec<quil_types::store::ShardInfo>> {
+            Ok(vec![])
+        }
+        fn put_app_shard(
+            &self,
+            _: &dyn quil_types::store::Transaction,
+            _: &quil_types::store::ShardInfo,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn delete_app_shard(
+            &self,
+            _: &dyn quil_types::store::Transaction,
+            _: &[u8],
+            _: &[u32],
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn stub_shards_store() -> StubShardsStore {
+        StubShardsStore
+    }
+
+    /// Minimal in-memory ClockStore for testnet genesis tests.
+    struct TestClockStore {
+        frames: std::sync::Mutex<std::collections::HashMap<u64, global::GlobalFrame>>,
+        qc: std::sync::Mutex<Option<global::QuorumCertificate>>,
+    }
+
+    impl TestClockStore {
+        fn new() -> Self {
+            Self {
+                frames: std::sync::Mutex::new(std::collections::HashMap::new()),
+                qc: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    /// No-op transaction for TestClockStore.
+    struct TestTxn;
+    impl quil_types::store::Transaction for TestTxn {
+        fn get(&self, _: &[u8]) -> quil_types::error::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn set(&self, _: &[u8], _: &[u8]) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn commit(self: Box<Self>) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn delete(&self, _: &[u8]) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn abort(self: Box<Self>) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn new_iter(
+            &self,
+            _: &[u8],
+            _: &[u8],
+        ) -> quil_types::error::Result<Box<dyn quil_types::store::Iterator>> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn delete_range(&self, _: &[u8], _: &[u8]) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    impl ClockStore for TestClockStore {
+        fn new_transaction(
+            &self,
+            _: bool,
+        ) -> quil_types::error::Result<Box<dyn quil_types::store::Transaction>> {
+            Ok(Box::new(TestTxn))
+        }
+        fn get_latest_global_clock_frame(&self) -> quil_types::error::Result<global::GlobalFrame> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn get_earliest_global_clock_frame(
+            &self,
+        ) -> quil_types::error::Result<global::GlobalFrame> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn get_global_clock_frame(
+            &self,
+            frame_number: u64,
+        ) -> quil_types::error::Result<global::GlobalFrame> {
+            self.frames
+                .lock()
+                .unwrap()
+                .get(&frame_number)
+                .cloned()
+                .ok_or_else(|| QuilError::NotFound("frame not found".into()))
+        }
+        fn put_global_clock_frame(
+            &self,
+            frame: &global::GlobalFrame,
+            _: &dyn quil_types::store::Transaction,
+        ) -> quil_types::error::Result<()> {
+            if let Some(h) = frame.header.as_ref() {
+                self.frames
+                    .lock()
+                    .unwrap()
+                    .insert(h.frame_number, frame.clone());
+            }
+            Ok(())
+        }
+        fn put_global_clock_frame_candidate(
+            &self,
+            _: &global::GlobalFrame,
+            _: &dyn quil_types::store::Transaction,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn get_global_clock_frame_candidate(
+            &self,
+            _: u64,
+            _: &[u8],
+        ) -> quil_types::error::Result<global::GlobalFrame> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn delete_global_clock_frame_range(&self, _: u64, _: u64) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn reset_global_clock_frames(&self) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn get_latest_certified_global_state(
+            &self,
+        ) -> quil_types::error::Result<global::GlobalProposal> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn get_earliest_certified_global_state(
+            &self,
+        ) -> quil_types::error::Result<global::GlobalProposal> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn get_certified_global_state(
+            &self,
+            _: u64,
+        ) -> quil_types::error::Result<global::GlobalProposal> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn put_certified_global_state(
+            &self,
+            _: &global::GlobalProposal,
+            _: &dyn quil_types::store::Transaction,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn get_latest_quorum_certificate(
+            &self,
+            _: &[u8],
+        ) -> quil_types::error::Result<global::QuorumCertificate> {
+            self.qc
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| QuilError::NotFound("no qc".into()))
+        }
+        fn get_quorum_certificate(
+            &self,
+            _: &[u8],
+            _: u64,
+        ) -> quil_types::error::Result<global::QuorumCertificate> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn put_quorum_certificate(
+            &self,
+            qc: &global::QuorumCertificate,
+            _: &dyn quil_types::store::Transaction,
+        ) -> quil_types::error::Result<()> {
+            *self.qc.lock().unwrap() = Some(qc.clone());
+            Ok(())
+        }
+        fn get_latest_timeout_certificate(
+            &self,
+            _: &[u8],
+        ) -> quil_types::error::Result<global::TimeoutCertificate> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn get_timeout_certificate(
+            &self,
+            _: &[u8],
+            _: u64,
+        ) -> quil_types::error::Result<global::TimeoutCertificate> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn put_timeout_certificate(
+            &self,
+            _: &global::TimeoutCertificate,
+            _: &dyn quil_types::store::Transaction,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn get_latest_shard_clock_frame(
+            &self,
+            _: &[u8],
+        ) -> quil_types::error::Result<global::AppShardFrame> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn get_shard_clock_frame(
+            &self,
+            _: &[u8],
+            _: u64,
+            _: bool,
+        ) -> quil_types::error::Result<global::AppShardFrame> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn commit_shard_clock_frame(
+            &self,
+            _: &[u8],
+            _: u64,
+            _: &[u8],
+            _: &dyn quil_types::store::Transaction,
+            _: bool,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn stage_shard_clock_frame(
+            &self,
+            _: &[u8],
+            _: &global::AppShardFrame,
+            _: &dyn quil_types::store::Transaction,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn get_staged_shard_clock_frame(
+            &self,
+            _: &[u8],
+            _: u64,
+            _: &[u8],
+            _: bool,
+        ) -> quil_types::error::Result<global::AppShardFrame> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn set_latest_shard_clock_frame_number(
+            &self,
+            _: &[u8],
+            _: u64,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn delete_shard_clock_frame_range(
+            &self,
+            _: &[u8],
+            _: u64,
+            _: u64,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn reset_shard_clock_frames(&self, _: &[u8]) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn get_latest_certified_app_shard_state(
+            &self,
+            _: &[u8],
+        ) -> quil_types::error::Result<global::AppShardProposal> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn put_certified_app_shard_state(
+            &self,
+            _: &global::AppShardProposal,
+            _: &dyn quil_types::store::Transaction,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn put_proposal_vote(
+            &self,
+            _: &dyn quil_types::store::Transaction,
+            _: &global::ProposalVote,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn get_proposal_vote(
+            &self,
+            _: &[u8],
+            _: u64,
+            _: &[u8],
+        ) -> quil_types::error::Result<global::ProposalVote> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn get_proposal_votes(
+            &self,
+            _: &[u8],
+            _: u64,
+        ) -> quil_types::error::Result<Vec<global::ProposalVote>> {
+            Ok(vec![])
+        }
+        fn put_timeout_vote(
+            &self,
+            _: &dyn quil_types::store::Transaction,
+            _: &global::TimeoutState,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn get_timeout_vote(
+            &self,
+            _: &[u8],
+            _: u64,
+            _: &[u8],
+        ) -> quil_types::error::Result<global::TimeoutState> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn get_timeout_votes(
+            &self,
+            _: &[u8],
+            _: u64,
+        ) -> quil_types::error::Result<Vec<global::TimeoutState>> {
+            Ok(vec![])
+        }
+        fn get_total_distance(
+            &self,
+            _: &[u8],
+            _: u64,
+            _: &[u8],
+        ) -> quil_types::error::Result<num_bigint::BigInt> {
+            Err(QuilError::NotFound("stub".into()))
+        }
+        fn set_total_distance(
+            &self,
+            _: &[u8],
+            _: u64,
+            _: &[u8],
+            _: &num_bigint::BigInt,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn get_peer_seniority_map(
+            &self,
+            _: &[u8],
+        ) -> quil_types::error::Result<std::collections::HashMap<String, u64>> {
+            Ok(std::collections::HashMap::new())
+        }
+        fn put_peer_seniority_map(
+            &self,
+            _: &dyn quil_types::store::Transaction,
+            _: &[u8],
+            _: &std::collections::HashMap<String, u64>,
+        ) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+        fn compact_data(&self, _: &[u8]) -> quil_types::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn resolve_testnet_prover_keys_from_seed() {
+        // Two 897-byte Falcon keys concatenated as hex
+        let key_a = vec![0xAAu8; 897];
+        let key_b = vec![0xBBu8; 897];
+        let mut seed_bytes = key_a.clone();
+        seed_bytes.extend_from_slice(&key_b);
+        let seed_hex = hex::encode(&seed_bytes);
+
+        let keys = resolve_testnet_prover_keys(1, &seed_hex, &[0xCC; 585]).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], key_a);
+        assert_eq!(keys[1], key_b);
+    }
+
+    #[test]
+    fn resolve_testnet_prover_keys_invalid_length() {
+        let bad_seed = hex::encode(vec![0xAA; 100]); // not a multiple of 585
+        let result = resolve_testnet_prover_keys(1, &bad_seed, &[0xCC; 585]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_testnet_prover_keys_empty_seed_uses_local() {
+        let local_key = vec![0xDDu8; 585];
+        let keys = resolve_testnet_prover_keys(1, "", &local_key).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0], local_key);
+    }
+
+    #[test]
+    fn resolve_testnet_prover_keys_network_99_uses_local() {
+        let seed_hex = hex::encode(vec![0xAAu8; 585]);
+        let local_key = vec![0xDDu8; 585];
+        let keys = resolve_testnet_prover_keys(99, &seed_hex, &local_key).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0], local_key);
+    }
+
+    #[test]
+    fn resolve_testnet_prover_keys_strips_embedded_spaces() {
+        // YAML folded scalars (`>` / `>-`) join lines with single spaces.
+        let key_a = vec![0xAAu8; 897];
+        let key_b = vec![0xBBu8; 897];
+        let seed_hex = format!("{} {}", hex::encode(&key_a), hex::encode(&key_b));
+
+        let keys = resolve_testnet_prover_keys(1, &seed_hex, &[0xCC; 585]).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], key_a);
+        assert_eq!(keys[1], key_b);
+    }
+
+    #[test]
+    fn resolve_testnet_prover_keys_strips_mixed_whitespace() {
+        // Newlines, tabs, and leading/trailing whitespace must all be tolerated.
+        let key_a = vec![0xAAu8; 897];
+        let key_b = vec![0xBBu8; 897];
+        let seed_hex = format!("  {}\n\t{}\n", hex::encode(&key_a), hex::encode(&key_b),);
+
+        let keys = resolve_testnet_prover_keys(1, &seed_hex, &[0xCC; 585]).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], key_a);
+        assert_eq!(keys[1], key_b);
+    }
+
+    #[test]
+    fn resolve_testnet_prover_keys_invalid_hex_char_still_errors() {
+        // Non-whitespace garbage should still produce a decode error,
+        // confirming the whitespace strip is not masking other invalid input.
+        let valid = hex::encode(vec![0xAAu8; 585]);
+        let seed_hex = format!("{} ZZ", valid);
+        let result = resolve_testnet_prover_keys(1, &seed_hex, &[0xCC; 585]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn establish_testnet_reward_vertices_creates_rewards() {
+        let crdt = test_crdt();
+        let pubkey = vec![0xAAu8; 585];
+        establish_testnet_reward_vertices(&[pubkey.clone()], &crdt).unwrap();
+
+        // Verify reward vertex exists in QUIL_TOKEN domain
+        let prover_address = materialize::prover_address_from_pubkey(&pubkey).unwrap();
+        let reward_addr = materialize::reward_address(&prover_address).unwrap();
+        let loc = quil_hypergraph::addressing::Location {
+            app_address: quil_execution::domains::QUIL_TOKEN,
+            data_address: reward_addr,
+        };
+        assert!(crdt.lookup_vertex(&loc), "reward vertex should exist");
+
+        // Verify reward data
+        let reward_data = crdt
+            .get_vertex_data(&loc)
+            .expect("reward data should exist");
+        let reward_tree = prover_registry::rebuild_vertex_tree_from_blob(&reward_data);
+        let cls = "reward:ProverReward";
+
+        // Verify type hash
+        assert_eq!(
+            quil_execution::global_schema::read_type(&reward_tree),
+            Some("reward:ProverReward"),
+        );
+
+        // Verify DelegateAddress
+        assert_eq!(
+            quil_execution::global_schema::read_field(&reward_tree, cls, "DelegateAddress"),
+            Some(reward_addr.to_vec()),
+        );
+
+        // Verify Balance = 10000 * 8_000_000_000
+        let balance_data = quil_execution::global_schema::read_field(&reward_tree, cls, "Balance")
+            .expect("Balance should be set");
+        assert_eq!(balance_data.len(), 32);
+        // Last 8 bytes should contain the value 80_000_000_000_000
+        let mut expected_balance = [0u8; 32];
+        let val = 10_000u64 * 8_000_000_000u64;
+        expected_balance[24..32].copy_from_slice(&val.to_be_bytes());
+        assert_eq!(balance_data, expected_balance.to_vec());
+    }
+
+    #[test]
+    fn initialize_testnet_genesis_single_prover() {
+        let crdt = test_crdt();
+        let clock_store = TestClockStore::new();
+        let pubkey = vec![0xEEu8; 585];
+
+        let shards_store = stub_shards_store();
+        let (frame, qc) = initialize_testnet_genesis_state(
+            1,  // network
+            "", // empty seed -> use local key
+            &pubkey,
+            10000, // difficulty
+            &clock_store,
+            &shards_store,
+            &crdt,
+            &NoopInclusionProver,
+        )
+        .unwrap();
+
+        // Verify frame header
+        let h = frame.header.as_ref().expect("frame should have header");
+        assert_eq!(h.frame_number, 0);
+        assert_eq!(h.parent_selector, vec![0u8; 32]);
+        assert_eq!(h.output, vec![0u8; 516]);
+        assert_eq!(h.difficulty, 10000);
+        assert!(h.timestamp > 0, "timestamp should be set to current time");
+        assert_eq!(h.global_commitments.len(), 256);
+        assert!(
+            h.prover_tree_commitment.len() > 0,
+            "prover tree commitment should be set"
+        );
+
+        // Verify QC
+        assert_eq!(qc.frame_number, 0);
+        assert_eq!(qc.rank, 0);
+
+        // Verify frame is stored and retrievable
+        let stored = clock_store.get_global_clock_frame(0).unwrap();
+        assert_eq!(stored.header.as_ref().unwrap().frame_number, 0,);
+
+        // Verify prover vertex exists in CRDT
+        let prover_address = materialize::prover_address_from_pubkey(&pubkey).unwrap();
+        let loc = quil_hypergraph::addressing::Location {
+            app_address: GLOBAL_INTRINSIC_ADDRESS,
+            data_address: prover_address,
+        };
+        assert!(crdt.lookup_vertex(&loc), "prover vertex should exist");
+
+        // Verify allocation vertex exists
+        let alloc_address = materialize::allocation_address(&pubkey, &[]).unwrap();
+        let alloc_loc = quil_hypergraph::addressing::Location {
+            app_address: GLOBAL_INTRINSIC_ADDRESS,
+            data_address: alloc_address,
+        };
+        assert!(
+            crdt.lookup_vertex(&alloc_loc),
+            "allocation vertex should exist"
+        );
+
+        // Verify reward vertex exists in QUIL_TOKEN domain
+        let reward_addr = materialize::reward_address(&prover_address).unwrap();
+        let reward_loc = quil_hypergraph::addressing::Location {
+            app_address: quil_execution::domains::QUIL_TOKEN,
+            data_address: reward_addr,
+        };
+        assert!(
+            crdt.lookup_vertex(&reward_loc),
+            "reward vertex should exist"
+        );
+    }
+
+    #[test]
+    fn initialize_testnet_genesis_idempotent() {
+        let crdt = test_crdt();
+        let clock_store = TestClockStore::new();
+        let pubkey = vec![0xFFu8; 585];
+
+        let shards_store = stub_shards_store();
+        // First call
+        let (frame1, _qc1) = initialize_testnet_genesis_state(
+            1,
+            "",
+            &pubkey,
+            10000,
+            &clock_store,
+            &shards_store,
+            &crdt,
+            &NoopInclusionProver,
+        )
+        .unwrap();
+
+        // Second call should return existing frame
+        let (frame2, _qc2) = initialize_testnet_genesis_state(
+            1,
+            "",
+            &pubkey,
+            10000,
+            &clock_store,
+            &shards_store,
+            &crdt,
+            &NoopInclusionProver,
+        )
+        .unwrap();
+
+        assert_eq!(
+            frame1.header.as_ref().unwrap().frame_number,
+            frame2.header.as_ref().unwrap().frame_number,
+        );
+    }
+
+    #[test]
+    fn initialize_genesis_dispatches_to_testnet() {
+        let crdt = test_crdt();
+        let clock_store = TestClockStore::new();
+        let pubkey = vec![0xAAu8; 585];
+
+        // network=1 should go to testnet path
+        let shards_store = stub_shards_store();
+
+        let (frame, _qc) = initialize_genesis(
+            1,
+            "",
+            &pubkey,
+            10000,
+            &clock_store,
+            &shards_store,
+            &crdt,
+            &NoopInclusionProver,
+        )
+        .unwrap();
+
+        let h = frame.header.as_ref().unwrap();
+        assert_eq!(h.frame_number, 0, "testnet genesis should be frame 0");
+    }
+
+    #[test]
+    fn restore_global_prover_seniority_restores_and_is_idempotent() {
+        let crdt = test_crdt();
+        let genesis_data = get_mainnet_genesis_data().unwrap();
+
+        // Establish the real mainnet genesis provers (seniority 23.6M each).
+        let state = HypergraphState::new(crdt.clone());
+        establish_mainnet_genesis_provers(&state, &genesis_data).unwrap();
+        state.commit().unwrap();
+        crdt.commit(0).unwrap();
+
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let beacon_pk = b64.decode(&genesis_data.beacon_bls48581_key).unwrap();
+        let beacon_addr = materialize::prover_address_from_pubkey(&beacon_pk).unwrap();
+        let va = hypergraph_state::vertex_adds_discriminator().unwrap();
+        let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+
+        let read_sen = |crdt: &Arc<HypergraphCrdt>| -> u64 {
+            let st = HypergraphState::new(crdt.clone());
+            let blob = st
+                .get(domain, &beacon_addr, va.as_slice())
+                .unwrap()
+                .unwrap();
+            let tree = prover_registry::rebuild_vertex_tree_from_blob(&blob);
+            quil_execution::global_schema::read_field(&tree, "prover:Prover", "Seniority")
+                .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+                .map(u64::from_be_bytes)
+                .unwrap_or(0)
+        };
+
+        // Sanity: established at the beacon seniority.
+        assert_eq!(read_sen(&crdt), MAINNET_BEACON_SENIORITY);
+
+        // Simulate the post-migration eviction bug: zero the beacon's seniority
+        // (preserving other fields), exactly as the read path would then see 0.
+        {
+            let st = HypergraphState::new(crdt.clone());
+            let blob = st
+                .get(domain, &beacon_addr, va.as_slice())
+                .unwrap()
+                .unwrap();
+            let mut tree = prover_registry::rebuild_vertex_tree_from_blob(&blob);
+            write_field(&mut tree, "prover:Prover", "Seniority", &0u64.to_be_bytes()).unwrap();
+            st.set(
+                domain,
+                &beacon_addr,
+                va.as_slice(),
+                1,
+                prover_registry::vertex_tree_to_blob(&tree),
+            )
+            .unwrap();
+            st.commit().unwrap();
+            crdt.commit(1).unwrap();
+        }
+        assert_eq!(
+            read_sen(&crdt),
+            0,
+            "seniority should be zeroed before restore"
+        );
+
+        // Restore corrects at least the beacon prover, back to the genesis value.
+        let fixed = restore_global_prover_seniority(&crdt, 2).unwrap();
+        assert!(
+            fixed >= 1,
+            "restore should correct at least the zeroed prover"
+        );
+        assert_eq!(
+            read_sen(&crdt),
+            MAINNET_BEACON_SENIORITY,
+            "seniority must be restored"
+        );
+
+        // Idempotent: a second run corrects nothing.
+        let fixed2 = restore_global_prover_seniority(&crdt, 3).unwrap();
+        assert_eq!(fixed2, 0, "restore must be a no-op once all are correct");
+    }
+
+    /// On a re-bootstrapped / freshly-migrated DB whose global prover tree is
+    /// EMPTY, restore must SEED the Falcon global committee (beacon + archives)
+    /// at `MAINNET_BEACON_SENIORITY` — the only post-genesis path that creates
+    /// them.
+    #[test]
+    fn restore_global_prover_seniority_seeds_missing_provers_into_empty_tree() {
+        let crdt = test_crdt();
+        let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+        let va = hypergraph_state::vertex_adds_discriminator().unwrap();
+
+        // Empty tree → restore seeds the 5 distinct global provers (the beacon
+        // shares an address with its own archive_peers entry, so 6 pubkeys map
+        // to 5 addresses).
+        let fixed = restore_global_prover_seniority(&crdt, 5).unwrap();
+        assert_eq!(
+            fixed, 5,
+            "should seed 5 distinct global provers into the empty tree"
+        );
+
+        let expected_addrs = [
+            "130d5a40665d051077671ec4be7989de7a0fb50c66622e43acaf1a23c4270c72",
+            "20891b99a2ec66f03f6dedc864d73c97307d3c2b548d40a5b7e87c6fa734faaf",
+            "1ce97148694de6e8b5469bf446ed9698e258c1f54936f02c15d49c53f73ad810",
+            "2a852ad433bfb63b0f00ce053f01d047c084687240be5659279668d0144fe9ff",
+            "061846da173daf0b5aad8cab107153529fe1387dea5b51d2535982213003e3f3",
+        ];
+        let st = HypergraphState::new(crdt.clone());
+        for addr_hex in expected_addrs {
+            let addr = hex::decode(addr_hex).unwrap();
+            let blob = st
+                .get(domain, &addr, va.as_slice())
+                .unwrap()
+                .unwrap_or_else(|| panic!("global prover {addr_hex} was not seeded"));
+            let tree = prover_registry::rebuild_vertex_tree_from_blob(&blob);
+            let sen =
+                quil_execution::global_schema::read_field(&tree, "prover:Prover", "Seniority")
+                    .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+                    .map(u64::from_be_bytes)
+                    .unwrap_or(0);
+            assert_eq!(sen, MAINNET_BEACON_SENIORITY, "seeded {addr_hex} seniority");
+        }
+
+        // Idempotent: a re-run finds them all and does nothing.
+        let fixed2 = restore_global_prover_seniority(&crdt, 6).unwrap();
+        assert_eq!(fixed2, 0, "re-run must be a no-op");
+    }
+
+    /// The Falcon-recut genesis dropped [`REMOVED_GLOBAL_PROVER_PEER_ID`]
+    /// from `archive_peers` entirely (its slot now carries the beacon's own
+    /// Falcon key), baking the removal into genesis itself: establishing
+    /// genesis already yields the fixed 5-member committee (beacon + 4
+    /// archives). The startup kick must therefore take its graceful no-op
+    /// branch and leave every established prover Active.
+    #[test]
+    fn remove_offline_global_prover_is_noop_and_idempotent_on_falcon_genesis() {
+        let crdt = test_crdt();
+        let genesis_data = get_mainnet_genesis_data().unwrap();
+
+        let state = HypergraphState::new(crdt.clone());
+        establish_mainnet_genesis_provers(&state, &genesis_data).unwrap();
+        state.commit().unwrap();
+        crdt.commit(0).unwrap();
+
+        // The removal is baked into the re-cut genesis: the offline peer is
+        // no longer in archive_peers at all.
+        assert!(
+            !genesis_data
+                .archive_peers
+                .contains_key(REMOVED_GLOBAL_PROVER_PEER_ID),
+            "offline peer must already be absent from the Falcon genesis archive_peers"
+        );
+
+        let va = hypergraph_state::vertex_adds_discriminator().unwrap();
+        let domain = &GLOBAL_INTRINSIC_ADDRESS[..];
+
+        let read_status = |addr: &[u8], cls: &str| -> Option<Vec<u8>> {
+            let st = HypergraphState::new(crdt.clone());
+            let blob = st.get(domain, addr, va.as_slice()).unwrap()?;
+            let tree = prover_registry::rebuild_vertex_tree_from_blob(&blob);
+            quil_execution::global_schema::read_field(&tree, cls, "Status")
+        };
+
+        // With nothing to kick, removal is a graceful no-op.
+        assert!(
+            !remove_offline_global_prover(&crdt, 1).unwrap(),
+            "removal must be a no-op"
+        );
+
+        // Every established genesis prover stays Active (1).
+        for pubkey_hex in genesis_data.archive_peers.values() {
+            let pubkey = hex::decode(pubkey_hex).unwrap();
+            let prover_addr = materialize::prover_address_from_pubkey(&pubkey).unwrap();
+            let alloc_addr = materialize::allocation_address(&pubkey, &[]).unwrap();
+            assert_eq!(
+                read_status(&alloc_addr, "allocation:ProverAllocation"),
+                Some(vec![1]),
+                "global allocation must stay Active"
+            );
+            assert_eq!(
+                read_status(&prover_addr, "prover:Prover"),
+                Some(vec![1]),
+                "prover vertex must stay Active"
+            );
+        }
+
+        // Idempotent.
+        assert!(
+            !remove_offline_global_prover(&crdt, 2).unwrap(),
+            "second run is a no-op"
+        );
+    }
+}

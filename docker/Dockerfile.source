@@ -1,0 +1,347 @@
+# syntax=docker.io/docker/dockerfile:1.19
+# Build on ubuntu:22.04 (glibc 2.35) so the dynamically-linked binaries
+# run on Ubuntu 22.04 hosts as well as newer releases — glibc symbol
+# versions are stamped from the build environment, and binaries linked
+# on 24.04 (glibc 2.39) refuse to load on 22.04. Runtime image stages
+# below stay on 24.04; the binary is forward-compatible.
+#
+# Build from the repository root, e.g.:
+#   docker build -f docker/Dockerfile.source --target=node --output node/build/amd64_linux .
+FROM ubuntu:22.04 AS base
+
+# Common environment variables
+ENV PATH="${PATH}:/root/.cargo/bin/"
+ARG TARGETOS
+ARG TARGETARCH
+
+# Install basics. Note: no apt libflint-dev (22.04 ships FLINT 2.8; the
+# flint-builder stage provides 3.0 under /usr/local) and no apt
+# protobuf-compiler (22.04 ships protoc 3.12, which predates the proto3
+# `optional` support prost-build needs — upstream protoc installed below).
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    git \
+    cmake \
+    libgmp-dev \
+    libmpfr-dev \
+    libmpfr6 \
+    wget \
+    m4 \
+    pkg-config \
+    gcc \
+    g++ \
+    make \
+    autoconf \
+    automake \
+    libtool \
+    libssl-dev \
+    clang \
+    unzip \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG PROTOC_VERSION=25.1
+# Maven's protobuf 3.25.1 publishes the same protoc 25.1 release. Keep
+# versions and fallback pins together; GitHub release downloads may fail.
+ARG PROTOC_MAVEN_VERSION=3.25.1
+RUN set -eu; \
+    ARCH=$(dpkg --print-architecture); \
+    case ${ARCH} in \
+    amd64) PROTOC_ARCH=x86_64; PROTOC_SHA256=936e423041c6977036208366507964d5615782b5a450ec8d3d52ff557ffc7101 ;; \
+    arm64) PROTOC_ARCH=aarch_64; PROTOC_SHA256=805a11a4de6985f135a708356742234e23140ae46367d31c2062160ad314020e ;; \
+    *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
+    esac; \
+    if curl -fsSL --retry 2 --retry-all-errors --retry-delay 2 --connect-timeout 15 --max-time 60 \
+        -o /tmp/protoc.zip \
+        "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip" \
+        && unzip -tq /tmp/protoc.zip >/dev/null; then \
+      unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'; \
+    else \
+      echo "GitHub protoc download unavailable; using verified same-version Maven artifacts"; \
+      MAVEN_PROTOBUF=https://repo.maven.apache.org/maven2/com/google/protobuf; \
+      curl -fsSL --retry 2 --retry-all-errors --retry-delay 2 --connect-timeout 15 --max-time 60 \
+        -o /tmp/protoc-maven.exe \
+        "${MAVEN_PROTOBUF}/protoc/${PROTOC_MAVEN_VERSION}/protoc-${PROTOC_MAVEN_VERSION}-linux-${PROTOC_ARCH}.exe"; \
+      printf '%s  %s\n' "${PROTOC_SHA256}" /tmp/protoc-maven.exe | sha256sum -c -; \
+      curl -fsSL --retry 2 --retry-all-errors --retry-delay 2 --connect-timeout 15 --max-time 60 \
+        -o /tmp/protobuf-java.jar \
+        "${MAVEN_PROTOBUF}/protobuf-java/${PROTOC_MAVEN_VERSION}/protobuf-java-${PROTOC_MAVEN_VERSION}.jar"; \
+      printf '%s  %s\n' 48a8e58a1a8f82eff141a7a388d38dfe77d7a48d5e57c9066ee37f19147e20df /tmp/protobuf-java.jar | sha256sum -c -; \
+      install -d /usr/local/bin /usr/local/include; \
+      install -m 0755 /tmp/protoc-maven.exe /usr/local/bin/protoc; \
+      unzip -o /tmp/protobuf-java.jar 'google/protobuf/*.proto' -d /usr/local/include; \
+    fi; \
+    installed_protoc_version=$(/usr/local/bin/protoc --version); \
+    test "${installed_protoc_version}" = "libprotoc ${PROTOC_VERSION}"; \
+    rm -f /tmp/protoc.zip /tmp/protoc-maven.exe /tmp/protobuf-java.jar
+
+# -----------------------------------------------------------------------------
+# Stage: gmp-builder
+# Purpose: Build GMP from source as a static, PIC archive. FLINT's static
+# code references internal `__gmpn_*` symbols that aren't guaranteed to be
+# exported by every distro's libgmp.so — users running the binary on a
+# host whose libgmp differs from our build image hit runtime
+# `symbol lookup error: undefined symbol: __gmpn_modexact_1_odd` failures.
+# Bundling GMP into the static link removes that dependency entirely.
+# -----------------------------------------------------------------------------
+FROM base AS gmp-builder
+
+ARG GMP_VERSION=6.3.0
+# sha256 of gmp-6.3.0.tar.xz; set it together with GMP_VERSION.
+ARG GMP_SHA256=a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898
+RUN wget https://gmplib.org/download/gmp/gmp-${GMP_VERSION}.tar.xz && \
+    echo "${GMP_SHA256}  gmp-${GMP_VERSION}.tar.xz" | sha256sum -c - && \
+    tar -xf gmp-${GMP_VERSION}.tar.xz && \
+    cd gmp-${GMP_VERSION} && \
+    ./configure \
+        --prefix=/usr/local \
+        --enable-static \
+        --disable-shared \
+        --with-pic \
+        CFLAGS="-O3" && \
+    make -j$(nproc) && \
+    make install
+
+# -----------------------------------------------------------------------------
+# Stage: flint-builder
+# Purpose: Build FLINT library (slowest component). Inherits the static GMP
+# from gmp-builder so FLINT's static archive links against the same GMP we
+# bundle into the final binary.
+# -----------------------------------------------------------------------------
+FROM gmp-builder AS flint-builder
+
+RUN git clone --branch flint-3.0 --depth 1 https://github.com/flintlib/flint.git && \
+    cd flint && \
+    ./bootstrap.sh && \
+    ./configure \
+    --prefix=/usr/local \
+    --with-gmp=/usr/local \
+    --with-mpfr=/usr/local \
+    --enable-static \
+    --disable-shared \
+    CFLAGS="-O3 -fPIC" && \
+    make -j$(nproc) && \
+    make install
+
+# -----------------------------------------------------------------------------
+# Stage: emp-builder
+# Purpose: Build EMP-toolkit libraries
+# -----------------------------------------------------------------------------
+FROM base AS emp-builder
+
+WORKDIR /opt/ceremonyclient
+COPY docker/build-emp.sh /opt/build-emp.sh
+COPY emp-tool emp-tool
+COPY emp-ot emp-ot
+RUN bash /opt/build-emp.sh
+
+# -----------------------------------------------------------------------------
+# Stage: rust-base
+# Purpose: Install the Rust toolchain
+# -----------------------------------------------------------------------------
+FROM base AS rust-base
+
+COPY docker/rustup-init.sh /opt/rustup-init.sh
+COPY rust-toolchain.toml /opt/rust-toolchain.toml
+RUN TOOLCHAIN=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)"/\1/p' /opt/rust-toolchain.toml) && \
+    test -n "$TOOLCHAIN" && \
+    /opt/rustup-init.sh -y --profile minimal --default-toolchain "$TOOLCHAIN"
+
+# -----------------------------------------------------------------------------
+# Stage: libs-context
+# Purpose: The static native libraries the Rust crates link against
+# -----------------------------------------------------------------------------
+FROM base AS libs-context
+# flint-builder inherits from gmp-builder, so copying its /usr/local brings
+# both libflint.a and libgmp.a along in one shot.
+COPY --from=flint-builder /usr/local /usr/local
+COPY --from=emp-builder /usr/local /usr/local
+
+# -----------------------------------------------------------------------------
+# Stage: common-context
+# Purpose: Native libraries, the Rust toolchain and the workspace crates
+# -----------------------------------------------------------------------------
+FROM libs-context AS common-context
+
+COPY --from=rust-base /root/.cargo /root/.cargo
+COPY --from=rust-base /root/.rustup /root/.rustup
+ENV PATH="${PATH}:/root/.cargo/bin/"
+
+ENV QUILIBRIUM_SIGNATURE_CHECK=true
+# The lattice proof backend (quil-lattice-proof-sys) runs its kernels natively:
+# plain x86-64 (SSE2, no -march here, so the binary runs on any amd64 host) or
+# NEON on arm64, which ignores this. docker/Dockerfile.sourceavx512 targets
+# AVX-512.
+ENV QUIL_LATTICE_X86_NATIVE=1
+
+WORKDIR /opt/ceremonyclient
+
+# Rust workspace files (rarely change)
+COPY Cargo.toml Cargo.lock ./
+
+# Rust crate sources (needed by the cargo builds in the build-* stages below).
+# BuildKit normalizes mtimes on COPY, so cargo's mtime-based fingerprint
+# check inside the target/ cache mount may over-rebuild. The cache mount
+# still provides value for the registry/git caches and for cargo's
+# content-derived intermediate artifacts.
+COPY crates crates
+
+# -----------------------------------------------------------------------------
+# Stage: build-context
+# Purpose: Aggregate source tree and static libraries for the Rust builds
+# -----------------------------------------------------------------------------
+FROM common-context AS build-context
+
+# Copy full source tree for the Rust builds. node/ is brought in by the stages
+# that need it, so changes there only bust those stages.
+COPY --exclude=node . .
+
+# -----------------------------------------------------------------------------
+# Stage: test-context
+# The build environment (full source + native deps) plus node/, whose compat
+# data several crates embed. `task test_rust_amd64_linux` runs the workspace
+# tests in it.
+# -----------------------------------------------------------------------------
+FROM build-context AS test-context
+COPY ./node /opt/ceremonyclient/node
+
+# -----------------------------------------------------------------------------
+# Stage: build-node
+# Builds the Rust node (crates/quil-node). The node also runs itself as its
+# confidential token proof verifier worker, so it is the only binary.
+# -----------------------------------------------------------------------------
+FROM build-context AS build-node
+ARG TARGETOS
+ARG TARGETARCH
+COPY ./node /opt/ceremonyclient/node
+WORKDIR /opt/ceremonyclient/node
+# build.sh compiles the Rust `quil-node` crate in release mode and installs it
+# at node/build/<platform>/node. The wildcard copy lets this same Dockerfile
+# serve amd64/arm64 Linux builds without a platform switch. build.sh writes to
+# node/build/<platform>/, outside the cache-mounted target/, so the cp after the
+# && finds the binary on the real filesystem.
+RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,id=cargo-target-${TARGETOS}-${TARGETARCH}-standard,target=/opt/ceremonyclient/target,sharing=locked \
+    CARGO_TIMINGS=1 ./build.sh && cp build/*/node /usr/bin/node
+
+# -----------------------------------------------------------------------------
+# Stage: build-qclient
+# Builds the Rust `qclient` (crates/quil-client). Uses the same native-lib
+# toolchain, explicit host target and target cache as build-node so common
+# dependencies can be reused. The cache is locked while Cargo is running.
+# -----------------------------------------------------------------------------
+FROM build-context AS build-qclient
+ARG TARGETOS
+ARG TARGETARCH
+WORKDIR /opt/ceremonyclient
+# quil-client depends on quil-execution, which embeds the genesis seniority
+# compat data from node/execution/... (retro JSONs via include_bytes! +
+# mainnet_244200_seniority.json via build.rs). build-context excludes node/,
+# so bring in just that data dir here.
+COPY ./node/build.sh /opt/ceremonyclient/node/build.sh
+COPY ./node/execution/intrinsics/global/compat /opt/ceremonyclient/node/execution/intrinsics/global/compat
+RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,id=cargo-target-${TARGETOS}-${TARGETARCH}-standard,target=/opt/ceremonyclient/target,sharing=locked \
+    CARGO_TIMINGS=1 CRATE_NAME=quil-client BIN_NAME=qclient OUT_BIN_NAME=qclient \
+    OUT_BASE_DIR=crates/quil-client/build bash node/build.sh && \
+    cp crates/quil-client/build/*/qclient /usr/bin/qclient
+
+# -----------------------------------------------------------------------------
+# Stage: node-only
+# -----------------------------------------------------------------------------
+FROM build-context AS build-qclient-console
+ARG TARGETOS
+ARG TARGETARCH
+ARG QCLIENT_CONSOLE_BUILD_COMMIT=uncommitted
+COPY ./node/execution/intrinsics/global/compat /opt/ceremonyclient/node/execution/intrinsics/global/compat
+WORKDIR /opt/ceremonyclient
+RUN --mount=type=cache,id=cargo-registry,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/root/.cargo/git,sharing=locked \
+    --mount=type=cache,id=console-target-${TARGETOS}-${TARGETARCH},target=/opt/ceremonyclient/target/console-release,sharing=locked \
+    QCLIENT_CONSOLE_BUILD_COMMIT="$QCLIENT_CONSOLE_BUILD_COMMIT" \
+    bash scripts/build-qclient-console.sh linux-amd64 /out
+
+FROM scratch AS qclient-console
+COPY --from=build-qclient-console /out/ /
+
+FROM ubuntu:24.04 AS node-only
+# Source builds aren't signed, so signature check is off for node and qclient.
+ENV QUILIBRIUM_SIGNATURE_CHECK=false
+
+ARG NODE_VERSION
+ARG GIT_REPO
+ARG GIT_BRANCH
+ARG GIT_COMMIT
+
+LABEL org.opencontainers.image.title="Quilibrium Network Node"
+LABEL org.opencontainers.image.description="Quilibrium is a decentralized alternative to platform as a service providers."
+LABEL org.opencontainers.image.version=$NODE_VERSION
+LABEL org.opencontainers.image.vendor=Quilibrium
+LABEL org.opencontainers.image.url=https://quilibrium.com/
+LABEL org.opencontainers.image.documentation=https://quilibrium.com/docs
+LABEL org.opencontainers.image.source=$GIT_REPO
+LABEL org.opencontainers.image.ref.name=$GIT_BRANCH
+LABEL org.opencontainers.image.revision=$GIT_COMMIT
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libgmp10 \
+    libmpfr6 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build-node /usr/bin/node /usr/local/bin/node
+WORKDIR /root
+ENTRYPOINT ["node"]
+
+# -----------------------------------------------------------------------------
+# Stage: exports (Scratch)
+# -----------------------------------------------------------------------------
+FROM scratch AS node
+COPY --from=build-node /usr/bin/node /node
+ENTRYPOINT [ "/node" ]
+
+FROM scratch AS qclient-unix
+COPY --from=build-qclient /usr/bin/qclient /qclient
+ENTRYPOINT [ "/qclient" ]
+
+FROM qclient-unix AS qclient-linux
+FROM qclient-unix AS qclient-darwin
+FROM qclient-${TARGETOS} AS qclient
+
+# -----------------------------------------------------------------------------
+# Stage: final (Default combined image)
+# -----------------------------------------------------------------------------
+FROM ubuntu:24.04 AS final
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libgmp10 \
+    libmpfr6 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Source builds aren't signed, so signature check is off for node and qclient.
+ENV QUILIBRIUM_SIGNATURE_CHECK=false
+
+ARG NODE_VERSION
+ARG GIT_REPO
+ARG GIT_BRANCH
+ARG GIT_COMMIT
+
+LABEL org.opencontainers.image.title="Quilibrium Network Node"
+LABEL org.opencontainers.image.description="Quilibrium is a decentralized alternative to platform as a service providers."
+LABEL org.opencontainers.image.version=$NODE_VERSION
+LABEL org.opencontainers.image.vendor=Quilibrium
+LABEL org.opencontainers.image.url=https://quilibrium.com/
+LABEL org.opencontainers.image.documentation=https://quilibrium.com/docs
+LABEL org.opencontainers.image.source=$GIT_REPO
+LABEL org.opencontainers.image.ref.name=$GIT_BRANCH
+LABEL org.opencontainers.image.revision=$GIT_COMMIT
+
+COPY --from=build-node /usr/bin/node /usr/local/bin
+COPY --from=build-qclient /usr/bin/qclient /usr/local/bin
+
+WORKDIR /root
+ENTRYPOINT ["node"]

@@ -1,0 +1,426 @@
+use crate::error::Result;
+
+/// Key types supported by the protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum KeyType {
+    Ed448 = 0,
+    X448 = 1,
+    Bls48581G1 = 2,
+    Bls48581G2 = 3,
+    Decaf448 = 4,
+    Secp256k1Sha256 = 5,
+    Secp256k1Sha3 = 6,
+    Ed25519 = 7,
+    /// Falcon / FN-DSA-512 post-quantum signatures (consensus).
+    Falcon512 = 8,
+    /// Streamlined NTRU Prime (sntrup761) post-quantum KEM — key agreement for
+    /// onion routing and config read keys (replaces X448).
+    Sntrup761 = 9,
+}
+
+/// A cryptographic signer that can produce signatures over messages.
+pub trait Signer: Send + Sync {
+    fn key_type(&self) -> KeyType;
+    fn public_key(&self) -> &[u8];
+    fn private_key(&self) -> &[u8];
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>>;
+    fn sign_with_domain(&self, message: &[u8], domain: &[u8]) -> Result<Vec<u8>>;
+}
+
+/// Output of BLS signature aggregation.
+pub struct BlsAggregateOutput {
+    pub signature: Vec<u8>,
+    pub public_key: Vec<u8>,
+}
+
+/// Constructor for BLS48-581 keys and signature operations.
+pub trait BlsConstructor: Send + Sync {
+    fn new_key(&self) -> Result<(Box<dyn Signer>, Vec<u8>)>;
+    fn from_bytes(&self, private_key: &[u8], public_key: &[u8]) -> Result<Box<dyn Signer>>;
+    fn verify_signature_raw(
+        &self,
+        public_key_g2: &[u8],
+        signature_g1: &[u8],
+        message: &[u8],
+        context: &[u8],
+    ) -> bool;
+    fn verify_multi_message_signature_raw(
+        &self,
+        public_key_g2: &[u8],
+        signature_g1: &[u8],
+        messages: &[&[u8]],
+        context: &[u8],
+    ) -> bool;
+
+    /// Verify an aggregate signature where signer `j` signed a DISTINCT
+    /// message `messages[j]` under public key `public_keys_g2[j]`, i.e.
+    /// `e(sig, g) == Π_j e(pk_j, H(context||m_j))`. This is the correct
+    /// multi-signer/multi-message BLS verify — NOT reducible to a single
+    /// aggregate pubkey (that only works when every signer signs the same
+    /// message). `public_keys_g2.len()` MUST equal `messages.len()`. Default
+    /// impl is unsupported; curve-backed constructors override it.
+    fn verify_multi_pubkey_multi_message_raw(
+        &self,
+        _public_keys_g2: &[&[u8]],
+        _signature_g1: &[u8],
+        _messages: &[&[u8]],
+        _context: &[u8],
+    ) -> bool {
+        false
+    }
+
+    /// Batch-verify many independent signatures at once. Each item is
+    /// `(public_key_g2, signature_g1, message, context)`, with the same
+    /// meaning as [`verify_signature_raw`]. Returns `true` iff EVERY
+    /// signature verifies.
+    ///
+    /// All-or-nothing: a `false` result only means "at least one is
+    /// invalid" — callers must fall back to per-signature
+    /// [`verify_signature_raw`] to find which. The default implementation
+    /// IS that per-signature loop; curves with a batched pairing check
+    /// (BLS48-581) override it with a random-linear-combination verify
+    /// that collapses N final exponentiations into one.
+    fn verify_signatures_batch(&self, items: &[(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)]) -> bool {
+        items
+            .iter()
+            .all(|(pk, sig, msg, ctx)| self.verify_signature_raw(pk, sig, msg, ctx))
+    }
+    fn aggregate(&self, public_keys: &[&[u8]], signatures: &[&[u8]]) -> Result<BlsAggregateOutput>;
+
+    /// Aggregate G2 public keys ONLY into a single aggregate public key —
+    /// the pubkey half of [`aggregate`], with no signatures involved. Used to
+    /// reconstruct a committee's aggregate pubkey from a participation bitmask
+    /// for consistency checks (e.g. FrameHeader verification), without the
+    /// wasteful throwaway-signature dance that abusing [`aggregate`] required.
+    /// Default impl is unsupported; curve-backed constructors override it.
+    fn aggregate_public_keys(&self, _public_keys: &[&[u8]]) -> Result<Vec<u8>> {
+        Err(crate::error::QuilError::Internal(
+            "aggregate_public_keys not supported by this BlsConstructor".into(),
+        ))
+    }
+}
+
+/// Multiproof output from inclusion proving.
+pub trait Multiproof: Send + Sync {
+    fn commitment(&self) -> &[u8];
+    fn proof(&self) -> &[u8];
+    fn evaluations(&self) -> Vec<Vec<u8>>;
+}
+
+/// KZG polynomial commitment-based inclusion prover.
+pub trait InclusionProver: Send + Sync {
+    /// Scheduling hint for full in-memory trie commits. Hash-based branch
+    /// commitments need coarse work to amortize Rayon overhead; expensive
+    /// provers can opt into parallel traversal at a smaller leaf count.
+    /// This affects scheduling only, never commitment contents.
+    fn commit_parallel_threshold(&self) -> usize {
+        256
+    }
+
+    /// Upper budget for independently scheduled trie subtrees. Expensive
+    /// commitment arithmetic can justify more work units for load balancing.
+    fn commit_parallel_budget(&self) -> usize {
+        8
+    }
+
+    fn commit_raw(&self, data: &[u8], poly_size: u64) -> Result<Vec<u8>>;
+    fn prove_raw(&self, data: &[u8], index: u64, poly_size: u64) -> Result<Vec<u8>>;
+    fn verify_raw(
+        &self,
+        data: &[u8],
+        commit: &[u8],
+        index: u64,
+        proof: &[u8],
+        poly_size: u64,
+    ) -> Result<bool>;
+    fn prove_multiple(
+        &self,
+        commitments: &[&[u8]],
+        polys: &[&[u8]],
+        indices: &[u64],
+        poly_size: u64,
+    ) -> Result<Box<dyn Multiproof>>;
+    fn verify_multiple(
+        &self,
+        commitments: &[&[u8]],
+        evaluations: &[&[u8]],
+        indices: &[u64],
+        poly_size: u64,
+        multi_commitment: &[u8],
+        proof: &[u8],
+    ) -> bool;
+}
+
+/// No-op inclusion prover that returns zero commitments and always verifies
+/// successfully. Used as a placeholder when no real KZG prover is available.
+pub struct NoopInclusionProver;
+
+impl InclusionProver for NoopInclusionProver {
+    fn commit_raw(&self, _: &[u8], _: u64) -> Result<Vec<u8>> {
+        Ok(vec![0u8; 64])
+    }
+    fn prove_raw(&self, _: &[u8], _: u64, _: u64) -> Result<Vec<u8>> {
+        Ok(vec![])
+    }
+    fn verify_raw(&self, _: &[u8], _: &[u8], _: u64, _: &[u8], _: u64) -> Result<bool> {
+        Ok(true)
+    }
+    fn prove_multiple(
+        &self,
+        _: &[&[u8]],
+        _: &[&[u8]],
+        _: &[u64],
+        _: u64,
+    ) -> Result<Box<dyn Multiproof>> {
+        Err(crate::error::QuilError::Internal(
+            "batch multiproof generation not supported".into(),
+        ))
+    }
+    fn verify_multiple(
+        &self,
+        _: &[&[u8]],
+        _: &[&[u8]],
+        _: &[u64],
+        _: u64,
+        _: &[u8],
+        _: &[u8],
+    ) -> bool {
+        true
+    }
+}
+
+/// Key manager for multi-algorithm signature verification. Dispatches
+/// based on `KeyType` to the appropriate verifier.
+///
+/// The execution layer's `Verify` methods on every prover op call
+/// `key_manager.validate_signature(key_type, public_key, message,
+/// signature, domain)`.
+pub trait KeyManager: Send + Sync {
+    /// Verify a signature over `message` using the key identified by
+    /// `key_type` and `public_key`. The `domain` is a context separator
+    /// that the signer used in `sign_with_domain`.
+    ///
+    /// Returns `Ok(true)` for valid, `Ok(false)` for invalid, and
+    /// `Err` for an internal error (e.g. unknown key type or malformed
+    /// key).
+    fn validate_signature(
+        &self,
+        key_type: KeyType,
+        public_key: &[u8],
+        message: &[u8],
+        signature: &[u8],
+        domain: &[u8],
+    ) -> Result<bool>;
+}
+
+/// Frame header construction and global-chain VDF verification.
+pub trait FrameProver: Send + Sync {
+    /// Build a new app-shard `FrameHeader` for `previous_frame_output`'s
+    /// successor, with `parent = poseidon(previous_frame_output)`. An empty
+    /// predecessor uses a zero parent sentinel. App frames have no VDF:
+    /// leave `output` empty for the caller to fill with the deterministic digest
+    /// after setting the rank, storage attestation and relay fields. That digest
+    /// binds the header to the selected global storage beacon (or the zero-anchor
+    /// beacon before a global chain is available).
+    fn prove_frame_header(
+        &self,
+        previous_frame_output: &[u8],
+        address: &[u8],
+        requests_root: &[u8],
+        state_roots: &[Vec<u8>],
+        prover: &[u8],
+        timestamp: i64,
+        difficulty: u32,
+        fee_multiplier_vote: u64,
+        frame_number: u64,
+        storage_attestation_root: &[u8],
+        global_frame_number: u64,
+    ) -> Result<crate::proto::global::FrameHeader>;
+
+    /// Build a new `GlobalFrameHeader` for `previous_frame.frame_number + 1`.
+    /// Mirrors Go's `WesolowskiFrameProver.ProveGlobalFrameHeader` at
+    /// `vdf/wesolowski_frame_prover.go:397-493` exactly:
+    ///
+    ///   parent = poseidon(previous_frame.output[:516])
+    ///   challenge = sha3(frame#||timestamp||difficulty||parent||
+    /// commitments...||prover_root||request_root)
+    ///   output = WesolowskiSolve(challenge, difficulty)
+    ///   signature = signer.SignWithDomain(challenge||output, "global")
+    fn prove_global_frame_header(
+        &self,
+        previous_frame: &crate::proto::global::GlobalFrameHeader,
+        commitments: &[Vec<u8>],
+        prover_root: &[u8],
+        // Prover shard phase 1/2/3 roots (vertex-removes, hyperedge-adds,
+        // hyperedge-removes), bound into the VDF challenge alongside
+        // `prover_root` (phase 0) and carried in `prover_tree_aux_roots`.
+        prover_aux_roots: &[Vec<u8>],
+        request_root: &[u8],
+        // Certified network world-state size as of the end of the parent
+        // frame; bound into the VDF challenge when non-zero.
+        world_state_size: u64,
+        signer: &dyn Signer,
+        timestamp: i64,
+        difficulty: u32,
+        prover_index: u8,
+    ) -> Result<crate::proto::global::GlobalFrameHeader>;
+
+    fn verify_global_frame_header(
+        &self,
+        header: &crate::proto::global::GlobalFrameHeader,
+    ) -> Result<Vec<u8>>;
+
+    fn calculate_multi_proof(
+        &self,
+        challenge: &[u8; 32],
+        difficulty: u32,
+        ids: &[&[u8]],
+        index: u32,
+    ) -> Result<Vec<u8>>;
+
+    fn verify_multi_proof(
+        &self,
+        challenge: &[u8; 32],
+        difficulty: u32,
+        ids: &[&[u8]],
+        alleged_solutions: &[&[u8]],
+    ) -> Result<bool>;
+
+    /// Verify the BLS aggregate signature carried by an app-shard frame
+    /// header. Mirrors Go
+    /// `WesolowskiFrameProver.VerifyFrameHeaderSignature` at
+    /// `vdf/wesolowski_frame_prover.go:327-395`.
+    ///
+    /// Returns `Ok(true)` when the signature verifies against the
+    /// signers' aggregated pubkey. When `ids` is `Some`, it is the FULL
+    /// active committee (the deterministic universe the multiproof's
+    /// challenge prime is bound to); the implementation re-derives the
+    /// PRESENT signer subset from the header bitmask and verifies only
+    /// their VDF multi-proofs against the committee-bound prime — partial
+    /// attendance is expected and accepted. `None` means single-signer
+    /// (74-byte aggregate) or BLS-only verification with no multi-proof.
+    ///
+    /// Default implementation returns an error — callers should use a
+    /// real `WesolowskiFrameProver` when BLS verify is required.
+    fn verify_frame_header_signature(
+        &self,
+        _header: &crate::proto::global::FrameHeader,
+        _bls: &dyn BlsConstructor,
+        _ids: Option<&[&[u8]]>,
+    ) -> Result<bool> {
+        Err(crate::error::QuilError::Internal(
+            "FrameProver::verify_frame_header_signature not implemented".into(),
+        ))
+    }
+
+    /// Batch-verify the BLS aggregate signatures of many shard
+    /// `FrameHeader`s at once (one multi-pairing + one final
+    /// exponentiation instead of N). On success, the prover records each
+    /// verified signature so a subsequent per-header
+    /// [`verify_frame_header_signature`] skips the (now-redundant) BLS
+    /// pairing — it still runs the VDF multiproof and structural checks.
+    /// Returns `true` iff EVERY header's BLS signature verified; on
+    /// `false` (at least one invalid) nothing is recorded and callers
+    /// fall back to per-header verification. The default does nothing and
+    /// returns `false` (no batching → per-header path runs as before).
+    fn verify_frame_header_signatures_batch(
+        &self,
+        _headers: &[&crate::proto::global::FrameHeader],
+        _bls: &dyn BlsConstructor,
+    ) -> bool {
+        false
+    }
+
+    /// Drop all recorded batch-preverified signatures. Called by the
+    /// materializer after each frame so the set can't grow or leak across
+    /// frames. Default no-op.
+    fn clear_bls_preverified(&self) {}
+
+    /// Verify the BLS aggregate signature on a `GlobalFrameHeader`.
+    /// Mirrors Go `WesolowskiFrameProver.VerifyGlobalHeaderSignature`
+    /// at `vdf/wesolowski_frame_prover.go:565-640`.
+    fn verify_global_header_signature(
+        &self,
+        _header: &crate::proto::global::GlobalFrameHeader,
+        _bls: &dyn BlsConstructor,
+    ) -> Result<bool> {
+        Err(crate::error::QuilError::Internal(
+            "FrameProver::verify_global_header_signature not implemented".into(),
+        ))
+    }
+}
+
+/// Result of a range proof generation.
+pub struct RangeProofResult {
+    pub proof: Vec<u8>,
+    pub commitments: Vec<u8>,
+}
+
+/// Bulletproof-based range proof and confidential transaction
+/// operations over the DECAF448 curve.
+pub trait BulletproofProver: Send + Sync {
+    /// Generate a range proof for 56-byte DECAF448 scalar values.
+    fn generate_range_proof(
+        &self,
+        values: &[Vec<u8>],
+        blinding: &[u8],
+        bit_size: u64,
+    ) -> Result<RangeProofResult>;
+
+    /// Generate input commitments from 56-byte scalar values.
+    fn generate_input_commitments(&self, values: &[Vec<u8>], blinding: &[u8]) -> Vec<u8>;
+
+    /// Verify a range proof against commitments.
+    fn verify_range_proof(&self, proof: &[u8], commitment: &[u8], bit_size: u64) -> bool;
+
+    /// Verify that inputs sum to outputs (+ fees).
+    fn sum_check(
+        &self,
+        inputs: &[Vec<u8>],
+        additional_inputs: &[Vec<u8>],
+        outputs: &[Vec<u8>],
+        additional_outputs: &[Vec<u8>],
+    ) -> bool;
+
+    /// Create a hidden signature (4 DECAF448 scalars: x, t, a, r).
+    fn sign_hidden(&self, x: &[u8], t: &[u8], a: &[u8], r: &[u8]) -> Vec<u8>;
+
+    /// Verify a hidden signature.
+    fn verify_hidden(
+        &self,
+        challenge: &[u8],
+        ext_transcript: &[u8],
+        s1: &[u8],
+        s2: &[u8],
+        s3: &[u8],
+        point: &[u8],
+        commitment: &[u8],
+    ) -> bool;
+
+    /// Simple Schnorr signature.
+    fn simple_sign(&self, secret_key: &[u8], message: &[u8]) -> Vec<u8>;
+
+    /// Verify a simple Schnorr signature.
+    fn simple_verify(&self, message: &[u8], signature: &[u8], point: &[u8]) -> bool;
+}
+
+/// Decaf448 elliptic curve agreement.
+pub trait DecafAgreement: Send + Sync {
+    fn private_key(&self) -> &[u8];
+    fn public_key(&self) -> &[u8];
+    fn agree_with(&self, other_public: &[u8]) -> Result<Vec<u8>>;
+    fn agree_with_and_hash_to_scalar(&self, other_public: &[u8]) -> Result<Vec<u8>>;
+    fn inverse_scalar(&self) -> Result<Vec<u8>>;
+    fn scalar_mult(&self, scalar: &[u8]) -> Result<Vec<u8>>;
+    fn add(&self, other: &[u8]) -> Result<Vec<u8>>;
+}
+
+/// Constructor for Decaf448 keys.
+pub trait DecafConstructor: Send + Sync {
+    fn new_key(&self) -> Result<Box<dyn DecafAgreement>>;
+    fn from_bytes(&self, private_key: &[u8]) -> Result<Box<dyn DecafAgreement>>;
+    fn hash_to_scalar(&self, data: &[u8]) -> Result<Vec<u8>>;
+    fn new_from_scalar(&self, scalar: &[u8]) -> Result<Box<dyn DecafAgreement>>;
+    fn alt_generator(&self) -> Vec<u8>;
+}

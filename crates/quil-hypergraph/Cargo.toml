@@ -1,0 +1,47 @@
+[package]
+name = "quil-hypergraph"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Hypergraph CRDT with add/remove sets and sync protocol"
+
+[features]
+test-utils = ["dep:jmt", "dep:borsh", "dep:anyhow"]
+
+[dependencies]
+quil-types = { path = "../quil-types" }
+quil-tries = { path = "../quil-tries" }
+# State tree: JMT forest (commitment authority post-migration).
+quil-forest = { path = "../quil-forest" }
+tonic = "0.12"
+tokio = { version = "1", features = ["sync", "rt"] }
+tracing = "0.1"
+thiserror = "2"
+num-bigint = "0.4"
+num-traits = "0.2"
+sha3 = "0.10"
+getrandom = "0.2"
+hex = "0.4"
+# The in-process tree reader of `testing` (test-utils).
+jmt = { version = "0.11", optional = true }
+borsh = { version = "1", features = ["derive"], optional = true }
+anyhow = { version = "1", optional = true }
+
+[dev-dependencies]
+proptest = "1"
+# Open a real DB for the forest in commit_to_forest tests.
+rocksdb = { version = "0.22", default-features = false, features = ["snappy", "lz4"] }
+tempfile = "3"
+# In-process forest TreeReader shim for the CRDT-level prover-tree sync
+# round-trip test (mirrors quil-rpc's RemoteTreeReader without gRPC).
+jmt = "0.11"
+borsh = { version = "1", features = ["derive"] }
+anyhow = "1"
+
+# Integration tests live in `tests/` and import the gated `testing`
+# module via `quil_hypergraph::testing`. Enable the feature on the
+# host crate so dev-dep builds resolve it. (The cfg(test) gate on
+# `pub mod testing;` in lib.rs only fires for in-crate unit tests, not
+# for the integration-test compilation unit.)
+[lints]
+workspace = true

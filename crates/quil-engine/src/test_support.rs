@@ -1,0 +1,930 @@
+//! Shared test helpers for `quil-engine` unit and integration tests.
+//!
+//! [`TestProverRegistry`] is a single configurable `ProverRegistry`
+//! stub carrying the union of state every consumer (shard_info,
+//! committee, worker_allocator, lifecycle, …) needs: prover info
+//! list, shard summaries, optional next-leader override, frame
+//! counter. Tests construct one, seed the relevant fields, and pass
+//! it through.
+//!
+//! Exposed publicly (behind `#[doc(hidden)]`) so integration tests
+//! in `crates/quil-engine/tests/` — which build the crate without
+//! `#[cfg(test)]` — can use the same mocks. The doc-hidden attribute
+//! keeps the mocks out of the user-facing docs.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use quil_types::consensus::{ProverInfo, ProverRegistry, ProverShardSummary, ProverStatus};
+use quil_types::error::Result;
+
+use crate::worker::{WorkerInfo, WorkerManager};
+
+/// All-purpose `ProverRegistry` stub. Each piece of state is
+/// independently configurable; default behavior is "empty registry,
+/// frame 0." Setters take `&self` so tests can mutate the stub
+/// from inside the call site under test (mirroring how the real
+/// registry handles concurrent updates).
+pub struct TestProverRegistry {
+    provers: Mutex<Vec<ProverInfo>>,
+    summaries: Mutex<Vec<ProverShardSummary>>,
+    /// When `Some`, `get_next_prover` returns this address; when
+    /// `None`, falls back to the first prover's address. Matches
+    /// the leader-pin behavior the `committee` tests need.
+    next_prover: Mutex<Option<Vec<u8>>>,
+    /// Registered storage leaf roots, keyed by `(member, leaf_id)` →
+    /// `(leaf_root, num_blocks, epoch)`. Production populates the equivalent via
+    /// the confirm intrinsic writing the prover trie; tests register directly so
+    /// the frame validator's registered-leaf cross-check on storage attestations
+    /// can pass. See [`Self::register_leaf_root`] / [`ProverRegistry::get_leaf_root`].
+    #[allow(clippy::type_complexity)]
+    leaf_roots: Mutex<std::collections::HashMap<(Vec<u8>, Vec<u8>, u64), (Vec<u8>, u64, u64)>>,
+    /// Storage seat slots, keyed by `(member, filter, epoch)`
+    /// ([`Self::set_storage_seat_slot`] / [`ProverRegistry::get_storage_seat_slot`]).
+    #[allow(clippy::type_complexity)]
+    seat_slots: Mutex<
+        std::collections::HashMap<(Vec<u8>, Vec<u8>, u64), quil_types::consensus::StorageSeatSlot>,
+    >,
+}
+
+impl Default for TestProverRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TestProverRegistry {
+    pub fn new() -> Self {
+        Self {
+            provers: Mutex::new(Vec::new()),
+            summaries: Mutex::new(Vec::new()),
+            next_prover: Mutex::new(None),
+            leaf_roots: Mutex::new(std::collections::HashMap::new()),
+            seat_slots: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Record `member`'s storage seat slot on `filter` for `slot.epoch`.
+    pub fn set_storage_seat_slot(
+        &self,
+        member: &[u8],
+        filter: &[u8],
+        slot: quil_types::consensus::StorageSeatSlot,
+    ) {
+        self.seat_slots
+            .lock()
+            .unwrap()
+            .insert((member.to_vec(), filter.to_vec(), slot.epoch), slot);
+    }
+
+    /// Register a member's storage leaf root so `get_leaf_root` returns it (the
+    /// frame validator cross-checks every storage-attestation opening against
+    /// this). `leaf_id` is the opening's `shard_id` (`leaf_id_bytes(filter, prefix)`).
+    pub fn register_leaf_root(
+        &self,
+        member: &[u8],
+        leaf_id: &[u8],
+        leaf_root: Vec<u8>,
+        num_blocks: u64,
+        epoch: u64,
+    ) {
+        self.leaf_roots.lock().unwrap().insert(
+            (member.to_vec(), leaf_id.to_vec(), epoch),
+            (leaf_root, num_blocks, epoch),
+        );
+    }
+
+    pub fn with_provers(provers: Vec<ProverInfo>) -> Self {
+        let r = Self::new();
+        *r.provers.lock().unwrap() = provers;
+        r
+    }
+
+    pub fn with_prover(info: ProverInfo) -> Self {
+        Self::with_provers(vec![info])
+    }
+
+    pub fn set_prover(&self, info: ProverInfo) {
+        let mut guard = self.provers.lock().unwrap();
+        // Replace if address matches, else append.
+        match guard.iter().position(|p| p.address == info.address) {
+            Some(i) => guard[i] = info,
+            None => guard.push(info),
+        }
+    }
+
+    /// Block every prover read until the guard drops.
+    pub fn hold_provers(&self) -> std::sync::MutexGuard<'_, Vec<ProverInfo>> {
+        self.provers.lock().unwrap()
+    }
+
+    pub fn set_provers(&self, provers: Vec<ProverInfo>) {
+        *self.provers.lock().unwrap() = provers;
+    }
+
+    pub fn set_summaries(&self, summaries: Vec<ProverShardSummary>) {
+        *self.summaries.lock().unwrap() = summaries;
+    }
+
+    pub fn set_next_prover(&self, address: Vec<u8>) {
+        *self.next_prover.lock().unwrap() = Some(address);
+    }
+}
+
+impl ProverRegistry for TestProverRegistry {
+    fn get_storage_seat_slot(
+        &self,
+        member: &[u8],
+        filter: &[u8],
+        epoch: u64,
+    ) -> Result<Option<quil_types::consensus::StorageSeatSlot>> {
+        Ok(self
+            .seat_slots
+            .lock()
+            .unwrap()
+            .get(&(member.to_vec(), filter.to_vec(), epoch))
+            .cloned())
+    }
+    fn get_prover_info(&self, address: &[u8]) -> Result<Option<ProverInfo>> {
+        Ok(self
+            .provers
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|p| p.address == address)
+            .cloned())
+    }
+
+    fn get_leaf_root(
+        &self,
+        member: &[u8],
+        leaf_id: &[u8],
+        epoch: u64,
+    ) -> Result<Option<(Vec<u8>, u64, u64)>> {
+        Ok(self
+            .leaf_roots
+            .lock()
+            .unwrap()
+            .get(&(member.to_vec(), leaf_id.to_vec(), epoch))
+            .cloned())
+    }
+
+    fn get_next_prover(
+        &self,
+        _input: &[u8; 32],
+        _filter: &[u8],
+        _frame_number: u64,
+    ) -> Result<Vec<u8>> {
+        if let Some(addr) = self.next_prover.lock().unwrap().clone() {
+            return Ok(addr);
+        }
+        Ok(self
+            .provers
+            .lock()
+            .unwrap()
+            .first()
+            .map(|p| p.address.clone())
+            .unwrap_or_default())
+    }
+
+    fn get_ordered_provers(
+        &self,
+        _: &[u8; 32],
+        _: &[u8],
+        _frame_number: u64,
+    ) -> Result<Vec<Vec<u8>>> {
+        Ok(self
+            .provers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.address.clone())
+            .collect())
+    }
+
+    fn get_active_provers(&self, filter: &[u8], frame_number: u64) -> Result<Vec<ProverInfo>> {
+        let provers = self.provers.lock().unwrap();
+        // Match the trait's committee contract: serving Leaving allocations
+        // remain members, while Joining/Paused are not active proof producers.
+        // Allocation-free Active fixtures retain the harness shorthand for
+        // an all-shard committee; an empty filter queries global membership.
+        let members = |floor: bool| {
+            provers
+                .iter()
+                .filter(|p| {
+                    (p.status == ProverStatus::Active
+                        && (filter.is_empty() || p.allocations.is_empty()))
+                        || p.allocations.iter().any(|a| {
+                            a.confirmation_filter == filter
+                                && (matches!(
+                                    a.effective_status(frame_number),
+                                    quil_types::consensus::EffectiveStatus::Active
+                                        | quil_types::consensus::EffectiveStatus::Leaving
+                                ) || (floor && a.status == ProverStatus::Active))
+                        })
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let strict = members(false);
+        Ok(if strict.is_empty() && !filter.is_empty() {
+            members(true)
+        } else {
+            strict
+        })
+    }
+
+    fn get_prover_count(&self, _filter: &[u8]) -> Result<usize> {
+        Ok(self.provers.lock().unwrap().len())
+    }
+
+    fn get_provers(&self, _filter: &[u8]) -> Result<Vec<ProverInfo>> {
+        Ok(self.provers.lock().unwrap().clone())
+    }
+
+    fn get_provers_by_status(
+        &self,
+        _filter: &[u8],
+        status: ProverStatus,
+    ) -> Result<Vec<ProverInfo>> {
+        Ok(self
+            .provers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.status == status)
+            .cloned()
+            .collect())
+    }
+
+    fn get_prover_shard_summaries(&self, _frame_number: u64) -> Result<Vec<ProverShardSummary>> {
+        Ok(self.summaries.lock().unwrap().clone())
+    }
+}
+
+/// Shared `WorkerManager` stub used across worker_allocator and
+/// lifecycle tests. Backs every operation by a single
+/// `HashMap<core_id, WorkerInfo>` so test setup is uniform:
+///
+/// - `add(info)` inserts/replaces a worker directly (use for
+/// tests that need pre-populated state).
+/// - `set_worker_filter(core_id, filter, start_consensus)`
+/// matches the production trait method and creates missing
+/// workers on demand.
+/// - `set_manually_managed` is also wired so tests can flip
+/// the manual flag without going through the full Worker
+/// plumbing.
+pub struct TestWorkerManager {
+    workers: Mutex<HashMap<u32, WorkerInfo>>,
+    /// Configured worker count; `None` uses the number of workers.
+    capacity: Mutex<Option<usize>>,
+    evictions: Mutex<Vec<(u32, Vec<Vec<u8>>)>>,
+    executions: Mutex<HashMap<u32, (Vec<u8>, quil_types::proto::node::WorkerExecution)>>,
+    unanswered: Mutex<HashMap<u32, (Vec<u8>, &'static str)>>,
+    shard_data: Mutex<HashMap<u32, Vec<(Vec<u8>, u64)>>>,
+    /// Workers above this count drain, as a thread manager's above its
+    /// configured count; `None` drains none.
+    drain_above: Mutex<Option<u32>>,
+    retired: Mutex<Vec<u32>>,
+    refuse_retirement: Mutex<bool>,
+    /// Workers whose eviction requests fail, as when their channel is full.
+    failing_evictions: Mutex<Vec<u32>>,
+}
+
+impl Default for TestWorkerManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TestWorkerManager {
+    pub fn new() -> Self {
+        Self {
+            workers: Mutex::new(HashMap::new()),
+            capacity: Mutex::new(None),
+            evictions: Mutex::new(Vec::new()),
+            executions: Mutex::new(HashMap::new()),
+            unanswered: Mutex::new(HashMap::new()),
+            shard_data: Mutex::new(HashMap::new()),
+            drain_above: Mutex::new(None),
+            retired: Mutex::new(Vec::new()),
+            refuse_retirement: Mutex::new(false),
+            failing_evictions: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Configure `count` workers, so those above it drain, as after an
+    /// operator lowers a thread manager's worker count.
+    pub fn set_configured_count(&self, count: u32) {
+        self.set_allocation_capacity(count as usize);
+        *self.drain_above.lock().unwrap() = Some(count);
+    }
+
+    /// Fail every retirement, as when a worker cannot be stopped.
+    pub fn refuse_retirement(&self) {
+        *self.refuse_retirement.lock().unwrap() = true;
+    }
+
+    /// Fail every eviction request to `cores`; failed requests are not
+    /// recorded in [`Self::evictions`].
+    pub fn fail_evictions(&self, cores: &[u32]) {
+        self.failing_evictions.lock().unwrap().extend(cores);
+    }
+
+    /// Workers retired so far, in order.
+    pub fn retired(&self) -> Vec<u32> {
+        self.retired.lock().unwrap().clone()
+    }
+
+    /// The shards whose data `core_id`'s store holds, with their cursors.
+    pub fn set_shard_data(&self, core_id: u32, shards: Vec<(Vec<u8>, u64)>) {
+        self.shard_data.lock().unwrap().insert(core_id, shards);
+    }
+
+    /// Configure fewer workers than there are records, as after an operator
+    /// lowers the worker count.
+    pub fn set_allocation_capacity(&self, capacity: usize) {
+        *self.capacity.lock().unwrap() = Some(capacity);
+    }
+
+    /// The execution report `core_id`'s engine gives for `filter`.
+    pub fn set_execution(
+        &self,
+        core_id: u32,
+        filter: &[u8],
+        execution: quil_types::proto::node::WorkerExecution,
+    ) {
+        self.executions
+            .lock()
+            .unwrap()
+            .insert(core_id, (filter.to_vec(), execution));
+    }
+
+    /// `core_id`, bound to `filter`, does not answer its report request.
+    pub fn set_unanswered(&self, core_id: u32, filter: &[u8], reason: &'static str) {
+        self.unanswered
+            .lock()
+            .unwrap()
+            .insert(core_id, (filter.to_vec(), reason));
+    }
+
+    /// Payload evictions requested so far, as `(core, protected filters)`.
+    pub fn evictions(&self) -> Vec<(u32, Vec<Vec<u8>>)> {
+        self.evictions.lock().unwrap().clone()
+    }
+
+    /// Insert or replace a worker directly. Useful when a test
+    /// wants to seed specific `pending_filter_frame` /
+    /// `allocated` / `manually_managed` combinations that the
+    /// trait's `set_worker_filter` can't reach.
+    pub fn add(&self, info: WorkerInfo) {
+        self.workers.lock().unwrap().insert(info.core_id, info);
+    }
+
+    /// Convenience for tests that want to set the filter
+    /// directly without going through `set_worker_filter`.
+    pub fn add_with_filter(&self, core_id: u32, filter: Vec<u8>) {
+        let allocated = !filter.is_empty();
+        self.add(WorkerInfo {
+            core_id,
+            filter,
+            available_storage: 0,
+            total_storage: 0,
+            manually_managed: false,
+            pending_filter_frame: 0,
+            allocated,
+        });
+    }
+}
+
+impl WorkerManager for TestWorkerManager {
+    fn allocation_capacity(&self) -> Result<usize> {
+        let configured = *self.capacity.lock().unwrap();
+        Ok(configured.unwrap_or_else(|| self.workers.lock().unwrap().len()))
+    }
+
+    fn is_draining(&self, core_id: u32) -> bool {
+        self.drain_above
+            .lock()
+            .unwrap()
+            .is_some_and(|count| core_id > count)
+    }
+
+    /// Like the thread manager: only an idle draining worker is retired.
+    fn retire_worker(&self, core_id: u32) -> Result<()> {
+        if !self.is_draining(core_id) {
+            return Err(quil_types::error::QuilError::InvalidArgument(format!(
+                "worker {core_id} is not draining"
+            )));
+        }
+        if *self.refuse_retirement.lock().unwrap() {
+            return Err(quil_types::error::QuilError::ExecutionUnavailable(format!(
+                "worker {core_id} cannot stop"
+            )));
+        }
+        let mut workers = self.workers.lock().unwrap();
+        if workers
+            .get(&core_id)
+            .is_some_and(|w| !w.filter.is_empty() || w.pending_filter_frame != 0)
+        {
+            return Err(quil_types::error::QuilError::InvalidArgument(format!(
+                "worker {core_id} holds a seat"
+            )));
+        }
+        if workers.remove(&core_id).is_some() {
+            self.retired.lock().unwrap().push(core_id);
+        }
+        Ok(())
+    }
+
+    /// Reports set with `set_execution`, for workers still bound to their filter.
+    fn worker_execution(&self) -> Vec<(u32, Vec<u8>, quil_types::proto::node::WorkerExecution)> {
+        let workers = self.workers.lock().unwrap();
+        self.executions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(core_id, (filter, _))| {
+                workers.get(core_id).is_some_and(|w| &w.filter == filter)
+            })
+            .map(|(core_id, (filter, execution))| (*core_id, filter.clone(), execution.clone()))
+            .collect()
+    }
+
+    /// Workers set with `set_unanswered`, still bound to their filter.
+    fn unanswered_workers(&self) -> Vec<(u32, Vec<u8>, &'static str)> {
+        let workers = self.workers.lock().unwrap();
+        self.unanswered
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(core_id, (filter, _))| {
+                workers.get(core_id).is_some_and(|w| &w.filter == filter)
+            })
+            .map(|(core_id, (filter, reason))| (*core_id, filter.clone(), *reason))
+            .collect()
+    }
+
+    fn evict_payload(&self, core_id: u32, keep: Vec<Vec<u8>>) -> Result<()> {
+        if self.failing_evictions.lock().unwrap().contains(&core_id) {
+            return Err(quil_types::error::QuilError::ExecutionUnavailable(
+                "payload eviction: channel full".into(),
+            ));
+        }
+        self.evictions.lock().unwrap().push((core_id, keep));
+        Ok(())
+    }
+
+    fn shard_data(&self) -> HashMap<u32, Vec<(Vec<u8>, u64)>> {
+        self.shard_data.lock().unwrap().clone()
+    }
+
+    fn set_worker_filter(&self, core_id: u32, filter: &[u8], start_consensus: bool) -> Result<()> {
+        let mut g = self.workers.lock().unwrap();
+        let entry = g.entry(core_id).or_insert(WorkerInfo {
+            core_id,
+            filter: Vec::new(),
+            available_storage: 0,
+            total_storage: 0,
+            manually_managed: false,
+            pending_filter_frame: 0,
+            allocated: false,
+        });
+        entry.filter = filter.to_vec();
+        entry.allocated = !filter.is_empty() && start_consensus;
+        Ok(())
+    }
+
+    fn deallocate_worker(&self, core_id: u32) -> Result<()> {
+        // Match ThreadWorkerManager: releasing an allocation makes the
+        // existing core idle; it does not remove the worker from the node.
+        // Keeping the entry is essential for allocator tests that release a
+        // stale filter and immediately bind that core to a live allocation.
+        if let Some(worker) = self.workers.lock().unwrap().get_mut(&core_id) {
+            worker.filter.clear();
+            worker.allocated = false;
+            worker.pending_filter_frame = 0;
+        }
+        Ok(())
+    }
+
+    fn check_workers_connected(&self) -> Result<Vec<u32>> {
+        Ok(self.workers.lock().unwrap().keys().copied().collect())
+    }
+
+    fn range_workers(&self) -> Result<Vec<WorkerInfo>> {
+        let mut out: Vec<WorkerInfo> = self.workers.lock().unwrap().values().cloned().collect();
+        out.sort_by_key(|w| w.core_id);
+        Ok(out)
+    }
+
+    fn respawn_worker(&self, core_id: u32, filter: &[u8]) -> Result<()> {
+        self.allocate_worker(core_id, filter)
+    }
+
+    fn set_manually_managed(&self, core_id: u32, manually_managed: bool) -> Result<()> {
+        let mut g = self.workers.lock().unwrap();
+        let entry = g.entry(core_id).or_insert(WorkerInfo {
+            core_id,
+            filter: Vec::new(),
+            available_storage: 0,
+            total_storage: 0,
+            manually_managed: false,
+            pending_filter_frame: 0,
+            allocated: false,
+        });
+        entry.manually_managed = manually_managed;
+        Ok(())
+    }
+
+    // Persist the pending-join marker (the trait default is a no-op).
+    // Needed so reconcile tests can observe the 10-frame pending-timeout
+    // sweep clearing a stuck marker.
+    fn set_pending_filter_frame(&self, core_id: u32, frame: u64) -> Result<()> {
+        if let Some(w) = self.workers.lock().unwrap().get_mut(&core_id) {
+            w.pending_filter_frame = frame;
+        }
+        Ok(())
+    }
+}
+
+// =====================================================================
+// SpawningWorkerManager
+// =====================================================================
+
+/// `WorkerManager` that, on `set_worker_filter(core_id, filter, start_consensus=true)`,
+/// invokes a caller-provided closure to spawn an `AppEngineHandle`
+/// for that filter. The closure owns whatever deps (clock store,
+/// frame prover, registry, etc.) are needed to construct an
+/// `AppConsensusEngine`. Resulting handles are stored so tests can
+/// route shard-bitmask messages to them.
+///
+/// Mirrors production's `ThreadWorkerManager::respawn` shape (which
+/// constructs an engine via core-pinned thread + `AppEngineHandle`).
+/// This variant runs everything on the current tokio runtime.
+pub struct SpawningWorkerManager {
+    workers: Mutex<HashMap<u32, crate::worker::WorkerInfo>>,
+    handles: Mutex<HashMap<u32, crate::app_engine::AppEngineHandle>>,
+    spawn_fn:
+        std::sync::Arc<dyn Fn(u32, Vec<u8>) -> crate::app_engine::AppEngineHandle + Send + Sync>,
+}
+
+impl SpawningWorkerManager {
+    pub fn new(
+        spawn_fn: std::sync::Arc<
+            dyn Fn(u32, Vec<u8>) -> crate::app_engine::AppEngineHandle + Send + Sync,
+        >,
+    ) -> Self {
+        Self {
+            workers: Mutex::new(HashMap::new()),
+            handles: Mutex::new(HashMap::new()),
+            spawn_fn,
+        }
+    }
+
+    /// Snapshot of all spawned engine handles, keyed by core_id.
+    pub fn snapshot_handles(&self) -> Vec<(u32, crate::app_engine::AppEngineHandle)> {
+        self.handles
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    }
+
+    /// Pre-seed a worker entry (sets storage caps + flags) so the
+    /// allocator can discover it.
+    pub fn add(&self, info: crate::worker::WorkerInfo) {
+        self.workers.lock().unwrap().insert(info.core_id, info);
+    }
+}
+
+impl crate::worker::WorkerManager for SpawningWorkerManager {
+    fn set_worker_filter(&self, core_id: u32, filter: &[u8], start_consensus: bool) -> Result<()> {
+        let mut g = self.workers.lock().unwrap();
+        let entry = g.entry(core_id).or_insert(crate::worker::WorkerInfo {
+            core_id,
+            filter: Vec::new(),
+            available_storage: 0,
+            total_storage: 0,
+            manually_managed: false,
+            pending_filter_frame: 0,
+            allocated: false,
+        });
+        entry.filter = filter.to_vec();
+        entry.allocated = !filter.is_empty() && start_consensus;
+        drop(g);
+
+        if start_consensus && !filter.is_empty() {
+            let handle = (self.spawn_fn)(core_id, filter.to_vec());
+            self.handles.lock().unwrap().insert(core_id, handle);
+        }
+        Ok(())
+    }
+
+    fn deallocate_worker(&self, core_id: u32) -> Result<()> {
+        self.workers.lock().unwrap().remove(&core_id);
+        self.handles.lock().unwrap().remove(&core_id);
+        Ok(())
+    }
+
+    fn check_workers_connected(&self) -> Result<Vec<u32>> {
+        Ok(self.workers.lock().unwrap().keys().copied().collect())
+    }
+
+    fn range_workers(&self) -> Result<Vec<crate::worker::WorkerInfo>> {
+        let mut out: Vec<crate::worker::WorkerInfo> =
+            self.workers.lock().unwrap().values().cloned().collect();
+        out.sort_by_key(|w| w.core_id);
+        Ok(out)
+    }
+
+    fn respawn_worker(&self, core_id: u32, filter: &[u8]) -> Result<()> {
+        self.set_worker_filter(core_id, filter, true)
+    }
+
+    fn set_pending_filter_frame(&self, core_id: u32, frame: u64) -> Result<()> {
+        let mut g = self.workers.lock().unwrap();
+        let entry = g.entry(core_id).or_insert(crate::worker::WorkerInfo {
+            core_id,
+            filter: Vec::new(),
+            available_storage: 0,
+            total_storage: 0,
+            manually_managed: false,
+            pending_filter_frame: 0,
+            allocated: false,
+        });
+        entry.pending_filter_frame = frame;
+        Ok(())
+    }
+}
+
+// =====================================================================
+// TestProverMessageTransport
+// =====================================================================
+
+/// In-memory [`ProverMessageTransport`] for tests. Captures every
+/// outbound bundle into a shared `Vec`, lets the test driver pop them
+/// and inject into whichever harness simulates the network. Returns a
+/// configurable `GlobalFrameHeader` for `submit_join`'s
+/// `latest_global_frame_header` call.
+///
+/// The transport owns a `head_header: Mutex<GlobalFrameHeader>` so the
+/// test can advance the "latest frame" as the chain progresses.
+pub struct TestProverMessageTransport {
+    head_header: std::sync::Mutex<quil_types::proto::global::GlobalFrameHeader>,
+    /// Outbound bundles captured in submission order. The test driver
+    /// drains this after each pipeline action.
+    outbound: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// Optional sink: when set, every outbound bundle is also pushed
+    /// into the provided callback. Useful for wiring directly into an
+    /// in-memory network without the test having to poll `outbound`.
+    sink: std::sync::Mutex<Option<std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync>>>,
+}
+
+impl Default for TestProverMessageTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TestProverMessageTransport {
+    pub fn new() -> Self {
+        Self {
+            head_header: std::sync::Mutex::new(
+                quil_types::proto::global::GlobalFrameHeader::default(),
+            ),
+            outbound: std::sync::Mutex::new(Vec::new()),
+            sink: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Set the header that `latest_global_frame_header` returns.
+    pub fn set_head_header(&self, h: quil_types::proto::global::GlobalFrameHeader) {
+        *self.head_header.lock().unwrap() = h;
+    }
+
+    /// Drain all captured outbound bundle bytes.
+    pub fn drain_outbound(&self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut *self.outbound.lock().unwrap())
+    }
+
+    /// Number of captured outbound bundles (peek without draining).
+    pub fn outbound_len(&self) -> usize {
+        self.outbound.lock().unwrap().len()
+    }
+
+    /// Install a sink that fires on every outbound bundle. Used to
+    /// wire the transport directly into an in-memory network so the
+    /// test doesn't have to poll `drain_outbound`.
+    pub fn set_sink(&self, sink: std::sync::Arc<dyn Fn(Vec<u8>) + Send + Sync>) {
+        *self.sink.lock().unwrap() = Some(sink);
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::prover_message_transport::ProverMessageTransport for TestProverMessageTransport {
+    async fn latest_global_frame_header(
+        &self,
+    ) -> quil_types::error::Result<quil_types::proto::global::GlobalFrameHeader> {
+        Ok(self.head_header.lock().unwrap().clone())
+    }
+
+    async fn publish_prover_bundle(&self, bundle_bytes: Vec<u8>) -> quil_types::error::Result<()> {
+        // Capture and forward.
+        let sink = self.sink.lock().unwrap().clone();
+        self.outbound.lock().unwrap().push(bundle_bytes.clone());
+        if let Some(sink) = sink {
+            sink(bundle_bytes);
+        }
+        Ok(())
+    }
+}
+
+// =====================================================================
+// TestKeyManager
+// =====================================================================
+
+/// Test [`quil_keys::KeyManager`] that wraps a pre-generated BLS48-581
+/// key pair. Used by `ProverPipeline` (which calls `get_signer` to
+/// sign `ProverJoin` / `ProverConfirm` payloads).
+///
+/// Only `Bls48581G1` is implemented — other key types return an error.
+pub struct TestKeyManager {
+    bls_private: Vec<u8>,
+    bls_public: Vec<u8>,
+}
+
+impl TestKeyManager {
+    pub fn new(bls_private: Vec<u8>, bls_public: Vec<u8>) -> Self {
+        Self {
+            bls_private,
+            bls_public,
+        }
+    }
+}
+
+impl quil_keys::KeyManager for TestKeyManager {
+    fn get_proving_key_id(&self) -> &str {
+        "test-key"
+    }
+
+    fn get_signer(
+        &self,
+        key_type: quil_types::crypto::KeyType,
+    ) -> quil_types::error::Result<Box<dyn quil_types::crypto::Signer>> {
+        match key_type {
+            quil_types::crypto::KeyType::Falcon512 => Ok(Box::new(
+                quil_crypto::FalconSigner::from_bytes(&self.bls_private, &self.bls_public),
+            )),
+            other => Err(quil_types::error::QuilError::Internal(format!(
+                "TestKeyManager does not support key type {:?}",
+                other
+            ))),
+        }
+    }
+
+    fn get_public_key(
+        &self,
+        key_type: quil_types::crypto::KeyType,
+    ) -> quil_types::error::Result<Vec<u8>> {
+        match key_type {
+            quil_types::crypto::KeyType::Falcon512 => Ok(self.bls_public.clone()),
+            other => Err(quil_types::error::QuilError::Internal(format!(
+                "TestKeyManager does not support key type {:?}",
+                other
+            ))),
+        }
+    }
+
+    fn get_private_key(
+        &self,
+        key_type: quil_types::crypto::KeyType,
+    ) -> quil_types::error::Result<Vec<u8>> {
+        match key_type {
+            quil_types::crypto::KeyType::Falcon512 => Ok(self.bls_private.clone()),
+            other => Err(quil_types::error::QuilError::Internal(format!(
+                "TestKeyManager does not support key type {:?}",
+                other
+            ))),
+        }
+    }
+
+    fn get_peer_id(&self) -> quil_types::error::Result<Vec<u8>> {
+        // Tests don't exercise the libp2p peer-id path; return a
+        // deterministic placeholder derived from the pubkey.
+        Ok(quil_crypto::poseidon::hash_bytes_to_32(&self.bls_public)
+            .map(|h| h.to_vec())
+            .unwrap_or_default())
+    }
+}
+
+// =====================================================================
+// AcceptAllKeyManager
+// =====================================================================
+
+/// Trivial [`quil_types::crypto::KeyManager`] for tests: every
+/// `validate_signature` returns `Ok(true)`. Plumbed into
+/// [`quil_execution::ExecutionEngineManager::new`] so the materializer
+/// can process ProverJoin / ProverConfirm bundles without the test
+/// having to produce byte-identical BLS aggregate signatures.
+///
+/// Not suitable for any production-bug verification path — by
+/// definition it ignores cryptographic state. Wrap a real BLS verifier
+/// when testing signature-failure paths.
+pub struct AcceptAllKeyManager;
+
+impl quil_types::crypto::KeyManager for AcceptAllKeyManager {
+    fn validate_signature(
+        &self,
+        _key_type: quil_types::crypto::KeyType,
+        _public_key: &[u8],
+        _message: &[u8],
+        _signature: &[u8],
+        _domain: &[u8],
+    ) -> quil_types::error::Result<bool> {
+        Ok(true)
+    }
+}
+
+/// A real Simplex finalization of `seal` by every member of `session`, for
+/// tests that drive a committee handoff without running a consensus host.
+pub fn certify_seal(
+    session: &quil_cw_consensus::handoff::Session,
+    signers: &[quil_crypto::FalconSigner],
+    seal: &quil_cw_consensus::handoff::Seal,
+) -> Vec<u8> {
+    certify_proposal(
+        session,
+        signers,
+        seal.view,
+        seal.checkpoint.view,
+        seal.digest(),
+    )
+}
+
+/// A real Simplex finalization by every member of `session` of the proposal
+/// of `digest` at `view` over `parent` (0: the session's genesis).
+pub fn certify_proposal(
+    session: &quil_cw_consensus::handoff::Session,
+    signers: &[quil_crypto::FalconSigner],
+    view: u64,
+    parent: u64,
+    digest: [u8; 32],
+) -> Vec<u8> {
+    use quil_cw_consensus::{
+        _consensus::{
+            simplex::{
+                scheme::Namespace,
+                types::{Finalization, Proposal, Subject},
+            },
+            types::{Epoch, Round, View},
+        },
+        _crypto::{sha256::Digest, Signer as _},
+        _utils::{ordered::Set, N3f1},
+        app_cert::encode_finalization,
+        falcon_base::FalconPrivateKey,
+        falcon_scheme::Generic,
+        falcon_simplex::SimplexFalconScheme,
+    };
+    use quil_types::crypto::Signer as _;
+    let keys: Vec<FalconPrivateKey> = signers
+        .iter()
+        .map(|s| FalconPrivateKey::from_bytes(s.private_key(), s.public_key()).unwrap())
+        .collect();
+    let proposal = Proposal::new(
+        Round::new(Epoch::new(session.generation), View::new(view)),
+        View::new(parent),
+        Digest(digest),
+    );
+    let participants: Set<_> = keys
+        .iter()
+        .map(|key| key.public_key())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let schemes: Vec<Generic<Namespace>> = keys
+        .iter()
+        .cloned()
+        .map(|key| {
+            Generic::signer(&session.namespace().unwrap(), participants.clone(), key).unwrap()
+        })
+        .collect();
+    let votes: Vec<_> = schemes
+        .iter()
+        .map(|scheme| {
+            scheme
+                .sign::<SimplexFalconScheme, Digest>(Subject::Finalize {
+                    proposal: &proposal,
+                })
+                .unwrap()
+        })
+        .collect();
+    let certificate = schemes[0]
+        .assemble::<SimplexFalconScheme, _, N3f1>(votes)
+        .unwrap();
+    encode_finalization(&Finalization {
+        proposal,
+        certificate,
+    })
+}

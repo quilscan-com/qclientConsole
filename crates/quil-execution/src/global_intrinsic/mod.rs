@@ -1,0 +1,86 @@
+//! Global intrinsic. Partial port of
+//! `node/execution/intrinsics/global/`.
+//!
+//! Scope notes:
+//!
+//! The full Go global intrinsic is ~7,000 LOC spread across twelve
+//! operation files (`global_prover_*.go`, `global_shard_*.go`,
+//! `global_prover_seniority_merge.go`) plus `global_intrinsic.go`
+//! itself. The state-transition side of that work touches the prover
+//! registry, frame prover, clock store, BLS constructor, RDF
+//! multiprover, and the lazy-vector-commitment tree — none of which
+//! have stable Rust trait surfaces yet.
+//!
+//! This module instead captures the **pure-data layer** that the
+//! dispatcher in `global_engine.rs` can route to today:
+//!
+//! - [`addressed_signature`] — the `BLS48581AddressedSignature`
+//! canonical-bytes envelope (type 0x011B).
+//! - [`prover_filter_ops`] — canonical-bytes for `ProverLeave`,
+//! `ProverPause`, `ProverResume`. All three share a
+//! filter(s) + frame_number + addressed-signature layout.
+//!
+//! Further ops (`ProverJoin`, `ProverConfirm`, `ProverReject`,
+//! `ProverKick`, `ProverUpdate`, `SeniorityMerge`, `ShardSplit`,
+//! `ShardMerge`) are left as follow-up work. Each one needs its own
+//! canonical-bytes module plus the per-op state-transition logic.
+
+pub mod addressed_signature;
+pub mod alt_shard_update_materialize;
+#[cfg(feature = "confidential-tokens")]
+pub mod commit_destinations;
+pub mod consensus_types;
+pub mod conversions;
+pub mod frame_header;
+pub mod handoff;
+pub mod intrinsic;
+pub mod kick_verify;
+pub mod leaf_root_registration;
+pub mod materialize;
+pub mod persistent_storage;
+pub mod proof_types;
+pub mod prover_filter_ops;
+pub mod prover_join;
+pub mod prover_ops;
+pub mod prover_release;
+pub mod prover_rings;
+pub mod prover_shard_update;
+pub mod prover_update_materialize;
+pub mod prover_verify;
+pub mod reassignment;
+#[cfg(feature = "confidential-tokens")]
+pub mod relay_coverage;
+pub mod seniority_merge;
+pub mod seniority_restoration;
+pub mod seniority_succession;
+pub mod sig_with_pop;
+pub mod storage_binding;
+pub mod storage_epoch_proof;
+pub mod storage_seat;
+pub mod storage_snapshot;
+pub mod verify;
+
+#[cfg(test)]
+mod shard_op_binding_tests;
+
+pub use addressed_signature::{
+    AddressedSignature, MAX_ADDRESSED_SIG_LEN, TYPE_BLS48581_ADDRESSED_SIGNATURE,
+};
+pub use frame_header::{
+    FrameHeader, GlobalFrameHeader, TYPE_FRAME_HEADER, TYPE_GLOBAL_FRAME_HEADER,
+};
+pub use leaf_root_registration::{
+    leaf_id_bytes, LeafRootRegistration, TYPE_LEAF_ROOT_REGISTRATION,
+};
+pub use prover_filter_ops::{
+    ProverLeave, ProverPause, ProverResume, MAX_PROVER_FILTERS_COUNT, MAX_PROVER_FILTER_LEN,
+    TYPE_PROVER_LEAVE, TYPE_PROVER_PAUSE, TYPE_PROVER_RESUME,
+};
+pub use prover_join::{ProverJoin, TYPE_PROVER_JOIN};
+pub use prover_ops::{
+    ProverConfirm, ProverKick, ProverReject, ProverSeniorityMerge, ProverUpdate, ShardMerge,
+    ShardSplit, TYPE_PROVER_CONFIRM, TYPE_PROVER_KICK, TYPE_PROVER_REJECT,
+    TYPE_PROVER_SENIORITY_MERGE, TYPE_PROVER_UPDATE, TYPE_SHARD_MERGE, TYPE_SHARD_SPLIT,
+};
+pub use seniority_merge::{SeniorityMerge, TYPE_SENIORITY_MERGE};
+pub use sig_with_pop::{SignatureWithPop, TYPE_BLS48581_SIG_WITH_POP};

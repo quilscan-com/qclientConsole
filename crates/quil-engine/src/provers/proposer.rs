@@ -1,0 +1,3302 @@
+//! Prover shard scoring and join/leave decision logic.
+//!
+//! Pure computation with no I/O, making it easy to unit test in isolation.
+//!
+//! Port of `node/consensus/provers/proposer.go`.
+
+use num_bigint::BigInt;
+use num_traits::Zero;
+use std::collections::HashMap;
+
+// Re-export the canonical PoMW basis from the rewards module so all
+// scoring callers use the same algorithm as Go's `reward.PomwBasis`.
+// The local `pomw_basis` below is preserved for backward compatibility
+// with existing callers but delegates to the canonical implementation.
+use crate::rewards::pomw_basis as canonical_pomw_basis;
+
+/// Reward strategy for shard selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Strategy {
+    /// Maximize expected reward per unit of work.
+    RewardGreedy,
+    /// Maximize data coverage (larger shards first).
+    DataGreedy,
+}
+
+impl Default for Strategy {
+    fn default() -> Self {
+        Self::RewardGreedy
+    }
+}
+
+/// Description of a shard for scoring purposes.
+#[derive(Debug, Clone)]
+pub struct ShardDescriptor {
+    /// Confirmation filter for the shard (routing key).
+    pub filter: Vec<u8>,
+    /// Size in bytes of this shard's state.
+    pub size: u64,
+    /// Ring attenuation factor (reward divided by 2^(Ring+1)).
+    pub ring: u8,
+    /// Logical shard-group count for sqrt divisor (>=1).
+    pub shards: u64,
+    /// Number of provers sharing this ring (including joiner if applicable).
+    pub active_on_ring: u64,
+    /// Total Active+Joining provers on the shard (independent of
+    /// ring assignment). Used for **ring math** (joiner-ring
+    /// computation in `compute_shard_ring_info`) — NOT for
+    /// halt-risk classification. Use `active_count` for that.
+    pub total_active_joining: u64,
+    /// Active-only prover count on the shard. Used for halt-risk
+    /// prioritization in `plan_and_allocate`, the confirm/leave
+    /// bypasses in `decide_joins`/`plan_leaves`/`decide_leaves`,
+    /// and `select_excess_active_filters`'s halt-risk exclusion.
+    ///
+    /// Joining provers MUST NOT count for halt-risk: they haven't
+    /// proven anything yet, and most pending joins on a small shard
+    /// get auto-rejected at the 67% threshold before reaching
+    /// Active. Counting them as coverage masked real halt-risk
+    /// shards in the wild (107 shards with
+    /// `active ≤ 3 && size > 0` were invisible to the halt-risk
+    /// bucket because joiners pushed `active+joining` above 3).
+    pub active_count: u64,
+    /// Confirmed joins that become members at the next epoch boundary. Unlike
+    /// a pending join, one cannot lapse or be withheld, so the shard counts it
+    /// as covered when deciding whether its pending joins bypass the score
+    /// threshold. Zero where not computed.
+    pub activating_count: u64,
+}
+
+/// Provers-per-shard ceiling that classifies a shard as halt-risk.
+/// At/under this count, losing a single prover risks dropping below
+/// the consensus quorum and halting the shard. Auto-allocation
+/// prioritizes joining these shards over picking the highest
+/// reward-greedy candidate.
+pub const HALT_RISK_PROVER_COUNT: u64 = 3;
+
+/// Provers a halt-risk shard must reach to stop being halt-risk.
+pub const HALT_RISK_TARGET: u64 = HALT_RISK_PROVER_COUNT + 1;
+
+/// Whether a halt-risk shard is still short of [`HALT_RISK_TARGET`] once its
+/// live joins confirm: where spare capacity (free workers, and the holdings
+/// the halt-risk swap sheds) should go. Halt-risk itself counts active
+/// provers only; a node can add one prover to a shard, so a shard whose
+/// joiners already cover the gap draws none. After a split, every node kept
+/// joining, and shedding holdings for, a child with 3 active and 51 joining.
+pub fn halt_risk_unstaffed(d: &ShardDescriptor) -> bool {
+    d.size > 0
+        && d.active_count <= HALT_RISK_PROVER_COUNT
+        && d.total_active_joining < HALT_RISK_TARGET
+}
+
+/// Score-driven leave threshold, as a percent of the best unallocated
+/// shard's score: an allocated shard is a pure-score leave candidate only
+/// when it scores below this fraction of the best available alternative.
+/// Lowered from the original 67% to 40% to curb worker churn — at 67%,
+/// on a small/forming network the optimistic joiner-ring score of the
+/// best unallocated shard is almost always ~2x a healthy holding, so every
+/// fine allocation perpetually trips the threshold and the node thrashes
+/// (leave → rejoin elsewhere → that shard dilutes → leave again). 40%
+/// means only a large, durable score gap justifies abandoning a holding.
+/// Paired with the `SCORE_LEAVE_MIN_HOLD_FRAMES` dwell in the lifecycle.
+pub const SCORE_LEAVE_THRESHOLD_PERCENT: u64 = 40;
+
+/// Confirm/reject threshold for `decide_joins` and `decide_leaves`, as a
+/// percent of the best contemporaneous candidate's score. The node keeps
+/// a pending JOIN only when its shard scores >= this fraction of the best
+/// pending join (else it self-withdraws → ProverReject); and it confirms
+/// a pending LEAVE only when the shard scores BELOW this fraction (else it
+/// stays). Lowered from the original 67% to 40% to match
+/// `SCORE_LEAVE_THRESHOLD_PERCENT` and stop the node from self-rejecting
+/// its own joins / over-confirming leaves on a contested fleet where the
+/// optimistic best score sits well above a healthy holding. Purely local
+/// proposer policy — NOT enforced at verification/materialization — so it
+/// only needs to be consistent fleet-wide (it is: single constant), not
+/// matched to any external validator.
+pub const SCORE_DECIDE_THRESHOLD_PERCENT: u64 = 40;
+
+/// A proposed shard allocation.
+#[derive(Debug, Clone)]
+pub struct Proposal {
+    pub worker_id: u32,
+    pub filter: Vec<u8>,
+    pub expected_reward: BigInt,
+    pub world_state_bytes: u64,
+    pub shard_size_bytes: u64,
+    pub ring: u8,
+    pub shards_denominator: u64,
+}
+
+struct Scored {
+    idx: usize,
+    score: BigInt,
+}
+
+/// A one-for-one score-driven worker replacement. `leave_filter` is only
+/// proposed when the allocator's next admissible candidate (`join_filter`)
+/// clears the established replacement margin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScoreReplacement {
+    pub leave_filter: Vec<u8>,
+    pub join_filter: Vec<u8>,
+    pub leave_score: BigInt,
+    pub join_score: BigInt,
+}
+
+/// Shard ring info — how rings are structured for a shard with N active+joining provers.
+#[derive(Debug, Clone)]
+pub struct ShardRingInfo {
+    pub current_ring: u8,
+    pub joiner_ring: u8,
+    pub active_on_current_ring: u64,
+    pub active_on_joiner_ring: u64,
+}
+
+/// Compute ring info from total active+joining prover count.
+///
+/// Port of Go's `computeShardRingInfo` at `node/consensus/global/worker_allocator.go:540-546`.
+/// Expected number of *other* provers that join a contended shard
+/// alongside us within the same decision window. The naive joiner ring
+/// assumes only we join (`total + 1`); but on a fleet where every prover
+/// greedily targets the same top-scoring (low-ring) shards, they all pile
+/// in at once, the shard's real ring jumps, its reward halves per ring,
+/// it falls below the 67% decide threshold, and the excess joins are
+/// rejected — the `Joining↔Rejected` churn observed in the field. Scoring
+/// the joiner ring as if this many extra provers also join de-prioritizes
+/// near-ring-boundary shards, steering each node toward shards with real
+/// headroom so picks spread instead of colliding. Tunable; `0` reproduces
+/// the original un-dampened joiner ring.
+pub const JOIN_CONTENTION_MARGIN: usize = 4;
+
+/// Joiner ring dampened by [`JOIN_CONTENTION_MARGIN`] — the ring this
+/// shard would land on if we plus `JOIN_CONTENTION_MARGIN` other provers
+/// all joined. Used only for *proposal* scoring (`build_proposal_descriptors`):
+/// the current-ring (decide/leave) path keeps the real ring. With margin
+/// `0` this equals `compute_shard_ring_info(total).joiner_ring`.
+pub fn dampened_joiner_ring(total_active_joining: usize) -> u8 {
+    ((total_active_joining + JOIN_CONTENTION_MARGIN) / 8) as u8
+}
+
+pub fn compute_shard_ring_info(total_active_joining: usize) -> ShardRingInfo {
+    let mut ri = ShardRingInfo {
+        current_ring: 0,
+        joiner_ring: 0,
+        active_on_current_ring: 0,
+        active_on_joiner_ring: 0,
+    };
+
+    if total_active_joining > 0 {
+        ri.current_ring = ((total_active_joining - 1) / 8) as u8;
+    }
+    ri.joiner_ring = (total_active_joining / 8) as u8;
+
+    ri.active_on_current_ring = (total_active_joining % 8) as u64;
+    if ri.active_on_current_ring == 0 && total_active_joining > 0 {
+        ri.active_on_current_ring = 8;
+    }
+
+    ri.active_on_joiner_ring = (total_active_joining % 8) as u64 + 1;
+
+    ri
+}
+
+/// PoMW basis calculation.
+///
+/// Compute the PoMW basis. Delegates to the canonical implementation
+/// in `crate::rewards::pomw_basis` so proposer scoring matches the
+/// reward issuance calculator (Go's `reward.PomwBasis`).
+///
+/// Previously this module had its own implementation that differed
+/// in scaling at generation ≥ 2. That divergence caused different
+/// nodes to produce different `plan_and_allocate`/`decide_joins`
+/// outcomes for the same difficulty + world bytes. Forwarding to the
+/// canonical version eliminates that drift.
+pub fn pomw_basis(difficulty: u64, world_state_bytes: u64, units: u64) -> BigInt {
+    canonical_pomw_basis(difficulty, world_state_bytes, units)
+}
+
+/// Returns `(filter, score)` ascending. Filters in `excluded` are
+/// dropped from the result.
+pub fn rank_allocated_by_score_ascending(
+    allocated_shards: &[ShardDescriptor],
+    difficulty: u64,
+    world_bytes: &BigInt,
+    units: u64,
+    strategy: Strategy,
+    excluded: &std::collections::HashSet<Vec<u8>>,
+) -> Vec<(Vec<u8>, BigInt)> {
+    if allocated_shards.is_empty() {
+        return Vec::new();
+    }
+    let basis = pomw_basis(difficulty, world_bytes.try_into().unwrap_or(1), units);
+    let scores = score_shards(allocated_shards, &basis, world_bytes, strategy);
+    let mut out: Vec<(Vec<u8>, BigInt)> = scores
+        .into_iter()
+        .filter_map(|sc| {
+            let filter = allocated_shards[sc.idx].filter.clone();
+            if excluded.contains(&filter) {
+                None
+            } else {
+                Some((filter, sc.score))
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    out
+}
+
+/// Score shards by expected reward.
+///
+/// Port of Go's `scoreShards` at `node/consensus/provers/proposer.go:326-392`.
+fn score_shards(
+    shards: &[ShardDescriptor],
+    basis: &BigInt,
+    world_bytes: &BigInt,
+    strategy: Strategy,
+) -> Vec<Scored> {
+    let mut scores = Vec::with_capacity(shards.len());
+
+    for (i, s) in shards.iter().enumerate() {
+        if s.filter.is_empty() || s.size == 0 {
+            continue;
+        }
+
+        let effective_shards = if s.shards == 0 { 1u64 } else { s.shards };
+
+        let score = match strategy {
+            Strategy::DataGreedy => BigInt::from(s.size),
+            Strategy::RewardGreedy => quil_execution::pricing::allocation_prover_reward(
+                basis,
+                &BigInt::from(s.size),
+                world_bytes,
+                s.ring,
+                effective_shards,
+            ),
+        };
+
+        scores.push(Scored { idx: i, score });
+    }
+
+    scores
+}
+
+/// Order candidates as the allocator does: halt-risk first, with the same
+/// per-node spread when provided, then descending score. Equal-score ties
+/// outside the halt-risk bucket have identical replacement economics.
+fn allocation_ordered_scores(
+    shards: &[ShardDescriptor],
+    basis: &BigInt,
+    world_bytes: &BigInt,
+    strategy: Strategy,
+    spread: Option<&[u8]>,
+) -> Vec<Scored> {
+    let mut scores = score_shards(shards, basis, world_bytes, strategy);
+    scores.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| shards[a.idx].filter.cmp(&shards[b.idx].filter))
+    });
+
+    let mut halt_risk = Vec::new();
+    let mut other = Vec::new();
+    for score in scores {
+        let shard = &shards[score.idx];
+        // The same bucket `plan_and_allocate` admits first.
+        if halt_risk_unstaffed(shard) {
+            halt_risk.push(score);
+        } else {
+            other.push(score);
+        }
+    }
+    if let Some(prover) = spread {
+        use sha2::Digest;
+        halt_risk.sort_by_cached_key(|s| -> [u8; 32] {
+            sha2::Sha256::digest([prover, shards[s.idx].filter.as_slice()].concat()).into()
+        });
+    }
+    halt_risk.extend(other);
+    halt_risk
+}
+
+/// Pair the allocator's next admissible replacements with the node's worst
+/// eligible holdings. A candidate may justify leaving only its paired holding;
+/// it cannot make several unrelated allocations look disposable.
+pub fn plan_score_replacements(
+    allocated_shards: &[ShardDescriptor],
+    unallocated_shards: &[ShardDescriptor],
+    difficulty: u64,
+    world_bytes: &BigInt,
+    units: u64,
+    strategy: Strategy,
+    min_hold_filters: &std::collections::HashSet<Vec<u8>>,
+) -> Vec<ScoreReplacement> {
+    plan_score_replacements_spread(
+        allocated_shards,
+        unallocated_shards,
+        difficulty,
+        world_bytes,
+        units,
+        strategy,
+        min_hold_filters,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_score_replacements_spread(
+    allocated_shards: &[ShardDescriptor],
+    unallocated_shards: &[ShardDescriptor],
+    difficulty: u64,
+    world_bytes: &BigInt,
+    units: u64,
+    strategy: Strategy,
+    min_hold_filters: &std::collections::HashSet<Vec<u8>>,
+    spread: Option<&[u8]>,
+) -> Vec<ScoreReplacement> {
+    if allocated_shards.is_empty() || unallocated_shards.is_empty() {
+        return Vec::new();
+    }
+
+    let basis = pomw_basis(difficulty, world_bytes.try_into().unwrap_or(1), units);
+    let replacements =
+        allocation_ordered_scores(unallocated_shards, &basis, world_bytes, strategy, spread);
+    let allocated_scores = score_shards(allocated_shards, &basis, world_bytes, strategy);
+    let mut holdings: Vec<&Scored> = allocated_scores
+        .iter()
+        .filter(|score| {
+            let shard = &allocated_shards[score.idx];
+            !(shard.size > 0 && shard.active_count <= HALT_RISK_PROVER_COUNT + 1)
+                && !min_hold_filters.contains(&shard.filter)
+        })
+        .collect();
+    holdings.sort_by(|a, b| a.score.cmp(&b.score));
+
+    replacements
+        .iter()
+        .zip(holdings)
+        .filter_map(|(replacement, holding)| {
+            let threshold = &replacement.score * BigInt::from(SCORE_LEAVE_THRESHOLD_PERCENT)
+                / BigInt::from(100);
+            (holding.score < threshold).then(|| ScoreReplacement {
+                leave_filter: allocated_shards[holding.idx].filter.clone(),
+                join_filter: unallocated_shards[replacement.idx].filter.clone(),
+                leave_score: holding.score.clone(),
+                join_score: replacement.score.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Plan which shards to join. Returns proposals for free workers.
+///
+/// Port of Go's `PlanAndAllocate` at `node/consensus/provers/proposer.go:98-269`.
+pub fn plan_and_allocate(
+    shards: &[ShardDescriptor],
+    difficulty: u64,
+    world_bytes: &BigInt,
+    units: u64,
+    free_worker_ids: &[u32],
+    max_allocations: usize,
+    strategy: Strategy,
+    // This prover's address, to order the halt-risk shards per node (see
+    // below); `None` keeps them in score order.
+    spread: Option<&[u8]>,
+) -> Vec<Proposal> {
+    if free_worker_ids.is_empty() || shards.is_empty() {
+        return Vec::new();
+    }
+
+    let basis = pomw_basis(difficulty, world_bytes.try_into().unwrap_or(1), units);
+    let mut scores = score_shards(shards, &basis, world_bytes, strategy);
+
+    // Sort by score descending, then by filter lexicographically (matches Go)
+    scores.sort_by(|a, b| {
+        let cmp = b.score.cmp(&a.score);
+        if cmp != std::cmp::Ordering::Equal {
+            return cmp;
+        }
+        shards[a.idx].filter.cmp(&shards[b.idx].filter)
+    });
+
+    // For reward-greedy: shuffle equal-score groups (Fisher-Yates)
+    if strategy != Strategy::DataGreedy && scores.len() > 1 {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let mut start = 0;
+        while start < scores.len() {
+            let mut end = start + 1;
+            while end < scores.len() && scores[end].score == scores[start].score {
+                end += 1;
+            }
+            if end - start > 1 {
+                for i in (start + 1..end).rev() {
+                    let j = rng.gen_range(start..=i);
+                    scores.swap(i, j);
+                }
+            }
+            start = end;
+        }
+    }
+
+    // Halt-risk priority: any shard at or under
+    // `HALT_RISK_PROVER_COUNT` (with size > 0) that its live joins do not
+    // already bring to `HALT_RISK_TARGET` ([`halt_risk_unstaffed`]) jumps
+    // to the front of the picking order regardless of its reward-greedy
+    // score. The
+    // scored ordering is preserved within each bucket so internal
+    // tie-breaking still flows from `score_shards`. Without this
+    // pass, a high-size 8-prover shard outscores a 3-prover shard
+    // and the auto-allocator continues piling onto already-healthy
+    // shards while halt-risk ones lose their last prover and the
+    // network halts.
+    let mut halt_risk: Vec<Scored> = Vec::new();
+    let mut other: Vec<Scored> = Vec::new();
+    for s in scores {
+        let d = &shards[s.idx];
+        if halt_risk_unstaffed(d) {
+            halt_risk.push(s);
+        } else {
+            other.push(s);
+        }
+    }
+    // Every node scores the same shards the same way, so in score order
+    // every node's first halt-risk pick is the same shard: the workers freed
+    // for four empty shards would all go to one of them, two would stay
+    // empty, and the next swaps would shed that one again. Coverage
+    // comes first here, not reward: each node takes the halt-risk shards in
+    // its own order, `sha256(address ‖ filter)`.
+    if let Some(prover) = spread {
+        use sha2::Digest;
+        halt_risk.sort_by_cached_key(|s| -> [u8; 32] {
+            sha2::Sha256::digest([prover, shards[s.idx].filter.as_slice()].concat()).into()
+        });
+    }
+    let halt_risk_total = halt_risk.len();
+    let other_total = other.len();
+    let halt_risk_top: Vec<String> = halt_risk
+        .iter()
+        .take(8)
+        .map(|s| {
+            let d = &shards[s.idx];
+            format!(
+                "{}:active={},joining={},size={}",
+                hex::encode(&d.filter),
+                d.active_count,
+                d.total_active_joining.saturating_sub(d.active_count),
+                d.size,
+            )
+        })
+        .collect();
+    let mut scores = halt_risk;
+    scores.extend(other);
+
+    let limit = max_allocations.min(free_worker_ids.len()).min(scores.len());
+
+    // Sort worker IDs deterministically so top-k shards go to lowest core IDs
+    let mut sorted_workers = free_worker_ids.to_vec();
+    sorted_workers.sort();
+
+    let wb = world_bytes.try_into().unwrap_or(0u64);
+    let proposals: Vec<Proposal> = (0..limit)
+        .map(|k| {
+            let sel = &shards[scores[k].idx];
+            Proposal {
+                worker_id: sorted_workers[k],
+                filter: sel.filter.clone(),
+                expected_reward: scores[k].score.clone(),
+                world_state_bytes: wb,
+                shard_size_bytes: sel.size,
+                ring: sel.ring,
+                shards_denominator: sel.shards,
+            }
+        })
+        .collect();
+
+    // Surface the halt-risk partition outcome so operators can
+    // confirm prioritization is working when halt-risk shards exist
+    // among the candidates. Picked entries are listed with their
+    // halt-risk classification so deviations from "halt-risk first"
+    // are visible in the log without needing per-shard debug.
+    let halt_risk_picked = proposals
+        .iter()
+        .filter(|p| {
+            let d = shards.iter().find(|s| s.filter == p.filter);
+            matches!(d, Some(d) if halt_risk_unstaffed(d))
+        })
+        .count();
+    let picks_summary: Vec<String> = proposals
+        .iter()
+        .map(|p| {
+            let halt = shards
+                .iter()
+                .any(|s| s.filter == p.filter && halt_risk_unstaffed(s));
+            format!(
+                "core={}:filter={}{}",
+                p.worker_id,
+                hex::encode(&p.filter),
+                if halt { ":halt-risk" } else { "" },
+            )
+        })
+        .collect();
+    if halt_risk_total > 0 || !proposals.is_empty() {
+        tracing::info!(
+            free_workers = free_worker_ids.len(),
+            candidates = shards.len(),
+            halt_risk_total,
+            halt_risk_picked,
+            other_total,
+            picked = proposals.len(),
+            ?halt_risk_top,
+            ?picks_summary,
+            strategy = ?strategy,
+            "plan_and_allocate decision"
+        );
+    }
+    proposals
+}
+
+/// Decide whether to confirm or reject pending joins.
+///
+/// Returns `(reject, confirm)` filter lists.
+///
+/// `candidate_shards` must be the union of **unallocated shards** (using
+/// `joiner_ring`) and the **pending-to-decide shards** (using `current_ring`),
+/// matching Go's `decideCandidates` at `worker_allocator.go:268-283`.
+/// Passing self's active allocations here causes perpetual rejection of
+/// pending joins (they score < 67% of the allocations' inflated bestScore).
+///
+/// `available_workers` is the count of unallocated worker slots. When
+/// nothing is rejected (all pending pass the threshold), Go caps
+/// confirms at this number and drops the rest — see
+/// `proposer.go:518-531`. `usize::MAX` disables the cap.
+pub fn decide_joins(
+    candidate_shards: &[ShardDescriptor],
+    pending: &[Vec<u8>],
+    difficulty: u64,
+    world_bytes: &BigInt,
+    units: u64,
+    strategy: Strategy,
+    available_workers: usize,
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let JoinDecision {
+        below_score: mut reject,
+        above_cap,
+        confirm,
+    } = decide_joins_by_reason(
+        candidate_shards,
+        pending,
+        difficulty,
+        world_bytes,
+        units,
+        strategy,
+        available_workers,
+    );
+    reject.extend(above_cap);
+    (reject, confirm)
+}
+
+/// What [`decide_joins_by_reason`] decided for the pending joins.
+#[derive(Debug, Default)]
+pub struct JoinDecision {
+    /// Rejected: below the score threshold, or the shard is no candidate.
+    pub below_score: Vec<Vec<u8>>,
+    /// Rejected: passed the threshold, but above the worker cap.
+    pub above_cap: Vec<Vec<u8>>,
+    pub confirm: Vec<Vec<u8>>,
+}
+
+/// [`decide_joins`], with the joins it rejects apart by why.
+pub fn decide_joins_by_reason(
+    candidate_shards: &[ShardDescriptor],
+    pending: &[Vec<u8>],
+    difficulty: u64,
+    world_bytes: &BigInt,
+    units: u64,
+    strategy: Strategy,
+    available_workers: usize,
+) -> JoinDecision {
+    if pending.is_empty() {
+        return JoinDecision::default();
+    }
+
+    let basis = pomw_basis(difficulty, world_bytes.try_into().unwrap_or(1), units);
+    let scores = score_shards(candidate_shards, &basis, world_bytes, strategy);
+
+    // Two indexes by hex-filter:
+    // - `by_hex`: score, for the threshold comparison
+    // - `desc_by_hex`: descriptor, for the halt-risk bypass below
+    // Indexing once keeps the per-pending loop O(1).
+    let mut by_hex: HashMap<String, BigInt> = HashMap::new();
+    let mut desc_by_hex: HashMap<String, &ShardDescriptor> = HashMap::new();
+    let mut best_score: Option<BigInt> = None;
+    for sc in &scores {
+        let d = &candidate_shards[sc.idx];
+        let key = hex::encode(&d.filter);
+        by_hex.insert(key.clone(), sc.score.clone());
+        desc_by_hex.insert(key, d);
+        if best_score.as_ref().map_or(true, |b| sc.score > *b) {
+            best_score = Some(sc.score.clone());
+        }
+    }
+
+    let best = match best_score {
+        Some(b) => b,
+        None => {
+            let reject: Vec<Vec<u8>> = pending
+                .iter()
+                .filter(|p| !p.is_empty())
+                .take(100)
+                .cloned()
+                .collect();
+            return JoinDecision {
+                below_score: reject,
+                ..JoinDecision::default()
+            };
+        }
+    };
+
+    // Threshold = best * SCORE_DECIDE_THRESHOLD_PERCENT / 100
+    let threshold = &best * BigInt::from(SCORE_DECIDE_THRESHOLD_PERCENT) / BigInt::from(100);
+
+    let mut reject = Vec::new();
+    let mut confirm = Vec::new();
+
+    for p in pending {
+        if p.is_empty() {
+            continue;
+        }
+        if reject.len() > 99 || confirm.len() > 99 {
+            break;
+        }
+
+        let key = hex::encode(p);
+        match by_hex.get(&key) {
+            None => reject.push(p.clone()),
+            Some(score) => {
+                // Halt-risk bypass: confirm regardless of score when the
+                // shard is at or below the halt-risk prover threshold and
+                // has real data (size > 0). Without this, `plan_and_allocate`
+                // proposes joins for halt-risk shards by overriding score
+                // ordering, then `decide_joins` immediately auto-rejects
+                // them ~360 frames later because a larger non-halt-risk
+                // shard's score sits above the 67% threshold. The two paths
+                // disagree on policy, joins are wasted, and halt-risk shards
+                // can still lose their last prover.
+                //
+                // Rust-only divergence from Go's `proposer.go:DecideJoins`,
+                // which applies a flat threshold.
+                //
+                // Every joiner bypasses, not just the few the shard lacks:
+                // any agreed order of who goes first is one a malicious
+                // joiner can grind its address into and then never confirm.
+                // `halt_risk_unstaffed` keeps the joins themselves to need.
+                // Confirmed joins count: they become members at the boundary
+                // and cannot be withheld, so a shard they lift above the
+                // threshold is no longer at halt risk.
+                let halt_risk = desc_by_hex.get(&key).is_some_and(|d| {
+                    d.size > 0 && d.active_count + d.activating_count <= HALT_RISK_PROVER_COUNT
+                });
+
+                if halt_risk || *score >= threshold {
+                    confirm.push(p.clone());
+                } else {
+                    reject.push(p.clone());
+                }
+            }
+        }
+    }
+
+    // availableWorkers cap (Go `proposer.go:518-531`). Rank confirmations
+    // before truncating, using the same halt-risk-first then reward order as
+    // `plan_and_allocate`, so scarce worker slots are committed to the most
+    // useful shards. `pending` is registry iteration order, which is
+    // incidental. The cap applies whether or not other joins were rejected,
+    // and the joins above it are rejected: a join neither confirmed nor
+    // rejected in its confirm epoch lapses and blocks a re-join of its
+    // shard for 720 frames.
+    let mut above_cap = Vec::new();
+    if !confirm.is_empty() && available_workers != usize::MAX {
+        confirm.sort_by(|a, b| {
+            let rank = |filter: &Vec<u8>| {
+                let key = hex::encode(filter);
+                let descriptor = desc_by_hex.get(&key).copied();
+                let halt_risk = descriptor
+                    .map(|d| d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT)
+                    .unwrap_or(false);
+                let score = by_hex.get(&key).cloned().unwrap_or_else(BigInt::zero);
+                (halt_risk, score)
+            };
+            let (a_halt_risk, a_score) = rank(a);
+            let (b_halt_risk, b_score) = rank(b);
+            b_halt_risk
+                .cmp(&a_halt_risk)
+                .then_with(|| b_score.cmp(&a_score))
+                .then_with(|| a.cmp(b))
+        });
+        if confirm.len() > available_workers {
+            above_cap = confirm.split_off(available_workers);
+        }
+    }
+
+    JoinDecision {
+        below_score: reject,
+        above_cap,
+        confirm,
+    }
+}
+
+/// Identify shards to leave (overcrowded / poor reward / halt-risk swap).
+///
+/// Returns up to 3 filter candidates for ProverLeave.
+///
+/// `free_workers` is the count of currently-free auto-managed workers.
+/// It bounds the halt-risk swap: if `halt_risk_count > free_workers`,
+/// the deficit is the number of healthy non-halt-risk allocations we
+/// are willing to shed *this cycle* to free slots for the waiting
+/// halt-risk shards. When `free_workers` already covers the deficit,
+/// the swap doesn't fire — the next `plan_and_allocate` will fill the
+/// free slots with halt-risk shards (because of the join-side
+/// priority bucket) without us martyring healthy allocations.
+///
+/// Port of Go's `PlanLeaves` at `proposer.go:558-646`.
+pub fn plan_leaves(
+    allocated_shards: &[ShardDescriptor],
+    unallocated_shards: &[ShardDescriptor],
+    difficulty: u64,
+    world_bytes: &BigInt,
+    units: u64,
+    strategy: Strategy,
+    free_workers: usize,
+    // Filters exempt from *pure-score* leaves because their allocation
+    // was confirmed too recently (within `SCORE_LEAVE_MIN_HOLD_FRAMES`).
+    // A freshly-established, producing allocation is "fine" — don't shed
+    // it to chase a marginally-higher unallocated shard. Halt-risk swap
+    // picks below ignore this set (coverage takes priority).
+    min_hold_filters: &std::collections::HashSet<Vec<u8>>,
+) -> Vec<Vec<u8>> {
+    plan_leaves_releasing(
+        allocated_shards,
+        unallocated_shards,
+        difficulty,
+        world_bytes,
+        units,
+        strategy,
+        free_workers,
+        min_hold_filters,
+        &|_| true,
+    )
+    .filters
+}
+
+/// What [`plan_leaves_releasing`] picks.
+#[derive(Debug, Default)]
+pub struct LeavePlan {
+    /// Up to 3 filters to leave, worst-scoring first.
+    pub filters: Vec<Vec<u8>>,
+    /// The ones among `filters` picked only to free a worker for a halt-risk
+    /// shard: they score above the leave threshold.
+    pub halt_risk_swaps: Vec<Vec<u8>>,
+}
+
+/// [`plan_leaves`], shedding for the halt-risk swap only allocations
+/// `releasable` admits: those whose shard would confirm this node's leave
+/// ([`releasable_member`]). Every member of a healthy shard computes the same
+/// swap demand, but the shard confirms only the leavers it can spare; the
+/// others' leaves were rejected at their window and proposed again every
+/// epoch.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_leaves_releasing(
+    allocated_shards: &[ShardDescriptor],
+    unallocated_shards: &[ShardDescriptor],
+    difficulty: u64,
+    world_bytes: &BigInt,
+    units: u64,
+    strategy: Strategy,
+    free_workers: usize,
+    min_hold_filters: &std::collections::HashSet<Vec<u8>>,
+    releasable: &dyn Fn(&[u8]) -> bool,
+) -> LeavePlan {
+    plan_leaves_releasing_spread(
+        allocated_shards,
+        unallocated_shards,
+        difficulty,
+        world_bytes,
+        units,
+        strategy,
+        free_workers,
+        min_hold_filters,
+        releasable,
+        None,
+    )
+}
+
+/// [`plan_leaves_releasing`] with the same per-node halt-risk order as
+/// [`plan_and_allocate`].
+#[allow(clippy::too_many_arguments)]
+pub fn plan_leaves_releasing_spread(
+    allocated_shards: &[ShardDescriptor],
+    unallocated_shards: &[ShardDescriptor],
+    difficulty: u64,
+    world_bytes: &BigInt,
+    units: u64,
+    strategy: Strategy,
+    free_workers: usize,
+    min_hold_filters: &std::collections::HashSet<Vec<u8>>,
+    releasable: &dyn Fn(&[u8]) -> bool,
+    spread: Option<&[u8]>,
+) -> LeavePlan {
+    if allocated_shards.is_empty() || unallocated_shards.is_empty() {
+        return LeavePlan::default();
+    }
+
+    let basis = pomw_basis(difficulty, world_bytes.try_into().unwrap_or(1), units);
+    let score_replacements = plan_score_replacements_spread(
+        allocated_shards,
+        unallocated_shards,
+        difficulty,
+        world_bytes,
+        units,
+        strategy,
+        min_hold_filters,
+        spread,
+    );
+    let score_replacement_filters: std::collections::HashSet<Vec<u8>> = score_replacements
+        .iter()
+        .map(|replacement| replacement.leave_filter.clone())
+        .collect();
+
+    // Halt-risk swap demand: count unallocated halt-risk shards (size>0,
+    // active_count <= HALT_RISK_PROVER_COUNT) we could cover. The deficit
+    // between that and our free worker slots is how many healthy
+    // allocations we shed this cycle to free room for them. Bounded by
+    // demand so we don't churn through every holding. NOTE: this is only
+    // trustworthy when coverage data is current — the CALLER must not run
+    // leave proposals while in degraded-coverage/prover-only mode, where
+    // `halt_risk_count` is a stale-view false positive (a node stuck in
+    // prover-only mode proposed swaps against a phantom halt-risk shard
+    // for hours).
+    let halt_risk_count = unallocated_shards
+        .iter()
+        .filter(|d| halt_risk_unstaffed(d))
+        .count();
+    let halt_risk_deficit = halt_risk_swap_demand(unallocated_shards, free_workers);
+
+    let alloc_scores = score_shards(allocated_shards, &basis, world_bytes, strategy);
+
+    // Halt-risk shield: never propose a leave on a shard that's already
+    // halt-risk, nor on one where our departure would push it into
+    // halt-risk. `active_count` includes us, so after we leave it drops
+    // by 1; to keep `post_leave > HALT_RISK_PROVER_COUNT` we skip any
+    // shard at or below `HALT_RISK_PROVER_COUNT + 1`.
+    let shielded_scores: Vec<&Scored> = alloc_scores
+        .iter()
+        .filter(|sc| {
+            let d = &allocated_shards[sc.idx];
+            !(d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT + 1)
+        })
+        .collect();
+
+    // Score-driven picks are explicit one-for-one replacements. The
+    // replacement planner uses the allocator's admission ordering and pairs
+    // each candidate with only one held shard, rather than letting the best
+    // global score evict every allocation below a common threshold.
+    let below_threshold: Vec<(Vec<u8>, BigInt)> = score_replacements
+        .iter()
+        .map(|replacement| {
+            (
+                replacement.leave_filter.clone(),
+                replacement.leave_score.clone(),
+            )
+        })
+        .collect();
+
+    // Halt-risk swap picks: when free workers can't cover the waiting
+    // halt-risk shards, shed `halt_risk_deficit` of the worst-scoring
+    // healthy (non-shielded) allocations to make room. Sorted worst-first.
+    let mut swap_candidates: Vec<(Vec<u8>, BigInt)> = shielded_scores
+        .iter()
+        .filter(|sc| !score_replacement_filters.contains(&allocated_shards[sc.idx].filter))
+        .filter(|sc| releasable(&allocated_shards[sc.idx].filter))
+        .map(|sc| (allocated_shards[sc.idx].filter.clone(), sc.score.clone()))
+        .collect();
+    swap_candidates.sort_by(|a, b| a.1.cmp(&b.1));
+
+    // Union below-threshold + halt-risk swap picks (deduped), worst-first.
+    let mut combined: Vec<(Vec<u8>, BigInt)> = below_threshold.clone();
+    let swap_picks = halt_risk_deficit.min(swap_candidates.len());
+    for c in swap_candidates.into_iter().take(swap_picks) {
+        if !combined.iter().any(|(f, _)| f == &c.0) {
+            combined.push(c);
+        }
+    }
+    combined.sort_by(|a, b| a.1.cmp(&b.1));
+
+    let picks: Vec<Vec<u8>> = combined.iter().take(3).map(|(f, _)| f.clone()).collect();
+
+    if !picks.is_empty() {
+        let picks_summary: Vec<String> = combined
+            .iter()
+            .take(3)
+            .map(|(f, score)| format!("{}:score={}", hex::encode(f), score.to_str_radix(10),))
+            .collect();
+        tracing::info!(
+            allocated = allocated_shards.len(),
+            unallocated = unallocated_shards.len(),
+            halt_risk_count,
+            free_workers,
+            halt_risk_deficit,
+            score_replacements = below_threshold.len(),
+            picked = picks.len(),
+            ?picks_summary,
+            strategy = ?strategy,
+            threshold_pct = SCORE_LEAVE_THRESHOLD_PERCENT,
+            "plan_leaves: proposing paired score replacements + halt-risk swap, shield applied"
+        );
+    }
+
+    let halt_risk_swaps = picks
+        .iter()
+        .filter(|f| !below_threshold.iter().any(|(below, _)| below == *f))
+        .cloned()
+        .collect();
+    LeavePlan {
+        filters: picks,
+        halt_risk_swaps,
+    }
+}
+
+/// Unallocated halt-risk shards their live joins do not staff
+/// ([`halt_risk_unstaffed`]) beyond what this node's free workers cover: the
+/// demand the halt-risk swap in [`plan_leaves`] sheds healthy allocations
+/// for. A node adds at most one prover to a shard, so each counts once.
+pub fn halt_risk_swap_demand(unallocated_shards: &[ShardDescriptor], free_workers: usize) -> usize {
+    unallocated_shards
+        .iter()
+        .filter(|d| halt_risk_unstaffed(d))
+        .count()
+        .saturating_sub(free_workers)
+}
+
+/// Whether `me` is one of the undecided `leaving` provers `filter` can
+/// release while keeping `HALT_RISK_PROVER_COUNT + 1` members, given the
+/// `staying` members it keeps after the boundary regardless
+/// ([`quil_types::consensus::LifecycleMembers::staying`]: confirmed leavers
+/// are in neither). The chain counts a leaving prover until it departs, so
+/// its floor does not stop every leaver of a shard confirming in the same
+/// epoch. Every node orders the leavers the same way, by
+/// `sha256(address ‖ filter)`, and only the first `spare` depart.
+pub fn chosen_to_depart(me: &[u8], filter: &[u8], staying: usize, leaving: &[Vec<u8>]) -> bool {
+    use sha2::Digest;
+    let spare = (staying + leaving.len()).saturating_sub(HALT_RISK_PROVER_COUNT as usize + 1);
+    let mut order: Vec<([u8; 32], &Vec<u8>)> = leaving
+        .iter()
+        .map(|address| {
+            (
+                sha2::Sha256::digest([address.as_slice(), filter].concat()).into(),
+                address,
+            )
+        })
+        .collect();
+    order.sort();
+    order
+        .iter()
+        .take(spare)
+        .any(|(_, address)| address.as_slice() == me)
+}
+
+/// Whether `me` is among the members of `filter` its shard would release if
+/// all of them proposed to leave: the ones [`chosen_to_depart`] picks from the
+/// whole membership. A swap leave from any other member is rejected at its
+/// window.
+pub fn releasable_member(me: &[u8], filter: &[u8], members: &[Vec<u8>]) -> bool {
+    chosen_to_depart(me, filter, 0, members)
+}
+
+/// Decide whether to confirm or reject pending leaves.
+///
+/// Returns `(reject, confirm)` filter lists.
+///
+/// Port of Go's `DecideLeaves` at `proposer.go:655-773`.
+pub fn decide_leaves(
+    shards: &[ShardDescriptor],
+    pending_leaves: &[Vec<u8>],
+    difficulty: u64,
+    world_bytes: &BigInt,
+    units: u64,
+    strategy: Strategy,
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    if pending_leaves.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    if shards.is_empty() {
+        let confirm: Vec<Vec<u8>> = pending_leaves
+            .iter()
+            .filter(|p| !p.is_empty())
+            .take(100)
+            .cloned()
+            .collect();
+        return (Vec::new(), confirm);
+    }
+
+    let basis = pomw_basis(difficulty, world_bytes.try_into().unwrap_or(1), units);
+    let scores = score_shards(shards, &basis, world_bytes, strategy);
+
+    // Two indexes by hex-filter, matching `decide_joins`:
+    // - `by_hex`: score, for the threshold comparison
+    // - `desc_by_hex`: descriptor, for the halt-risk bypass below
+    let mut by_hex: HashMap<String, BigInt> = HashMap::new();
+    let mut desc_by_hex: HashMap<String, &ShardDescriptor> = HashMap::new();
+    let mut best_score: Option<BigInt> = None;
+    for sc in &scores {
+        let d = &shards[sc.idx];
+        let key = hex::encode(&d.filter);
+        by_hex.insert(key.clone(), sc.score.clone());
+        desc_by_hex.insert(key, d);
+        if best_score.as_ref().map_or(true, |b| sc.score > *b) {
+            best_score = Some(sc.score.clone());
+        }
+    }
+
+    let best = match best_score {
+        Some(b) => b,
+        None => {
+            let confirm: Vec<Vec<u8>> = pending_leaves
+                .iter()
+                .filter(|p| !p.is_empty())
+                .take(100)
+                .cloned()
+                .collect();
+            return (Vec::new(), confirm);
+        }
+    };
+
+    // Threshold = best * SCORE_DECIDE_THRESHOLD_PERCENT / 100
+    // Reject leave (stay) if score >= threshold; confirm if < threshold.
+    let threshold = &best * BigInt::from(SCORE_DECIDE_THRESHOLD_PERCENT) / BigInt::from(100);
+
+    let mut reject = Vec::new();
+    let mut confirm = Vec::new();
+
+    for p in pending_leaves {
+        if p.is_empty() {
+            continue;
+        }
+        if reject.len() > 99 || confirm.len() > 99 {
+            break;
+        }
+
+        let key = hex::encode(p);
+        match by_hex.get(&key) {
+            None => confirm.push(p.clone()),
+            Some(score) => {
+                // Halt-risk bypass: reject (stay on shard) when the
+                // shard would be at halt risk once we depart. Our seat
+                // is Leaving and the Active count leaves it out, so
+                // the count already is the shard's after we go; see
+                // `decide_leaves_with_reserved_capacity`.
+                let is_halt_risk = desc_by_hex
+                    .get(&key)
+                    .map(|d| d.size > 0 && d.active_count <= HALT_RISK_PROVER_COUNT)
+                    .unwrap_or(false);
+
+                if is_halt_risk || *score >= threshold {
+                    reject.push(p.clone());
+                } else {
+                    confirm.push(p.clone());
+                }
+            }
+        }
+    }
+
+    (reject, confirm)
+}
+
+/// Decide each held leave against destinations that can actually take its
+/// worker. Another holding (including a higher-reward one) is not a replacement.
+/// Keep unknown holdings until reward inputs arrive; explicit cleanup is the
+/// lifecycle caller's responsibility. The existing decision threshold and
+/// coverage floor are preserved; scores are computed once per snapshot.
+#[allow(clippy::too_many_arguments)]
+pub fn decide_leaves_against_replacements(
+    held: &[ShardDescriptor],
+    available: &[ShardDescriptor],
+    pending: &[Vec<u8>],
+    difficulty: u64,
+    world_bytes: &BigInt,
+    units: u64,
+    strategy: Strategy,
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    decide_leaves_with_reserved_capacity(
+        held,
+        available,
+        pending,
+        difficulty,
+        world_bytes,
+        units,
+        strategy,
+        0,
+    )
+}
+
+/// Confirmed departures already supply future capacity for replacement demand.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decide_leaves_with_reserved_capacity(
+    held: &[ShardDescriptor],
+    available: &[ShardDescriptor],
+    pending: &[Vec<u8>],
+    difficulty: u64,
+    world_bytes: &BigInt,
+    units: u64,
+    strategy: Strategy,
+    reserved_capacity: usize,
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let basis = pomw_basis(difficulty, world_bytes.try_into().unwrap_or(1), units);
+    let held_scores: HashMap<&[u8], (&ShardDescriptor, BigInt)> =
+        score_shards(held, &basis, world_bytes, strategy)
+            .into_iter()
+            .map(|s| (held[s.idx].filter.as_slice(), (&held[s.idx], s.score)))
+            .collect();
+    let pending: std::collections::HashSet<&Vec<u8>> =
+        pending.iter().filter(|f| !f.is_empty()).take(100).collect();
+    let mut eligible: Vec<(&Vec<u8>, BigInt)> = pending
+        .iter()
+        .filter_map(|filter| {
+            let (holding, score) = held_scores.get(filter.as_slice())?;
+            // The halt-risk shield, applied to a seat that is already
+            // Leaving: the Active count leaves it out, so it is the shard's
+            // count after we depart. The plan shields at one over the
+            // halt-risk count because it counts our seat Active; doing the
+            // same here read our departure twice and rejected every leave
+            // the plan proposed off a shard one over its shield, so the
+            // seat was proposed and rejected again each cycle.
+            if (strategy == Strategy::RewardGreedy && holding.shards == 0)
+                || (holding.size > 0 && holding.active_count <= HALT_RISK_PROVER_COUNT)
+            {
+                return None;
+            }
+            Some((*filter, score.clone()))
+        })
+        .collect();
+    eligible.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+    let mut destinations = score_shards(available, &basis, world_bytes, strategy);
+    destinations.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| available[a.idx].filter.cmp(&available[b.idx].filter))
+    });
+    let mut seen_destinations = std::collections::HashSet::new();
+    destinations.retain(|s| seen_destinations.insert(available[s.idx].filter.clone()));
+    destinations.truncate(destinations.len().saturating_sub(reserved_capacity));
+    let mut confirmed = std::collections::HashSet::new();
+    // One destination supplies one future worker slot, never every holding
+    // below one global-best score. Spend scarce replacements on worst first.
+    for ((filter, score), destination) in eligible.into_iter().zip(destinations) {
+        let threshold =
+            destination.score * BigInt::from(SCORE_DECIDE_THRESHOLD_PERCENT) / BigInt::from(100);
+        if score >= threshold {
+            break;
+        }
+        confirmed.insert(filter.clone());
+    }
+    let mut reject = Vec::new();
+    let mut confirm = Vec::new();
+    let mut ordered: Vec<&Vec<u8>> = pending.into_iter().collect();
+    ordered.sort();
+    for filter in ordered {
+        if confirmed.contains(filter) {
+            confirm.push(filter.clone());
+        } else {
+            reject.push(filter.clone());
+        }
+    }
+    (reject, confirm)
+}
+
+/// Default issuance units constant (matches Go's 8_000_000_000).
+pub const DEFAULT_UNITS: u64 = 8_000_000_000;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // All six regular nodes propose a halt-risk swap leave off the same
+    // three shards in the same epoch. Confirming every one would empty them;
+    // only the provers a shard can spare go.
+    #[test]
+    fn a_shard_releases_only_the_leavers_it_can_spare() {
+        let filter = vec![0x42u8; 35];
+        let leavers: Vec<Vec<u8>> = (0x10u8..0x16).map(|b| vec![b; 32]).collect();
+        let chosen = |active: usize, leaving: &[Vec<u8>]| {
+            leaving
+                .iter()
+                .filter(|me| chosen_to_depart(me, &filter, active, leaving))
+                .count()
+        };
+        assert_eq!(chosen(0, &leavers), 2, "six members keep four");
+        assert_eq!(chosen(3, &leavers[..2]), 1);
+        assert_eq!(chosen(3, &leavers[..1]), 0, "four members spare none");
+        assert!(
+            !chosen_to_depart(&[0x99; 32], &filter, 0, &leavers),
+            "only a leaver departs"
+        );
+        // The order differs by shard, so one node is not picked off every
+        // shard it holds.
+        let picks = |f: &Vec<u8>| {
+            leavers
+                .iter()
+                .filter(|me| chosen_to_depart(me, f, 0, &leavers))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let first = picks(&filter);
+        assert!((0x43u8..0x4b).any(|b| picks(&vec![b; 35]) != first));
+    }
+
+    #[test]
+    fn dampened_joiner_ring_penalizes_near_boundary_shards() {
+        // Margin 4: shards with ample headroom keep their (low) ring;
+        // shards within `margin` of the next ring boundary are bumped up
+        // a ring (lower score) so the proposer avoids piling onto them.
+        assert_eq!(JOIN_CONTENTION_MARGIN, 4, "test assumes default margin");
+        assert_eq!(dampened_joiner_ring(0), 0); // empty → full headroom
+        assert_eq!(dampened_joiner_ring(3), 0); // headroom 5 > margin → unchanged
+        assert_eq!(dampened_joiner_ring(4), 1); // headroom 4 == margin → bumped
+        assert_eq!(dampened_joiner_ring(7), 1); // near boundary → bumped
+                                                // At/after a real boundary it matches the naive joiner ring.
+        assert_eq!(
+            dampened_joiner_ring(8),
+            compute_shard_ring_info(8).joiner_ring
+        );
+        assert_eq!(dampened_joiner_ring(12), 2); // naive would be 1 → bumped
+    }
+
+    #[test]
+    fn ring_info_empty() {
+        let ri = compute_shard_ring_info(0);
+        assert_eq!(ri.current_ring, 0);
+        assert_eq!(ri.joiner_ring, 0);
+        assert_eq!(ri.active_on_current_ring, 0);
+        assert_eq!(ri.active_on_joiner_ring, 1);
+    }
+
+    #[test]
+    fn ring_info_single() {
+        let ri = compute_shard_ring_info(1);
+        assert_eq!(ri.current_ring, 0);
+        assert_eq!(ri.joiner_ring, 0);
+        assert_eq!(ri.active_on_current_ring, 1);
+        assert_eq!(ri.active_on_joiner_ring, 2);
+    }
+
+    #[test]
+    fn ring_info_full_ring() {
+        let ri = compute_shard_ring_info(8);
+        assert_eq!(ri.current_ring, 0);
+        assert_eq!(ri.joiner_ring, 1);
+        assert_eq!(ri.active_on_current_ring, 8);
+        assert_eq!(ri.active_on_joiner_ring, 1);
+    }
+
+    #[test]
+    fn ring_info_second_ring() {
+        let ri = compute_shard_ring_info(9);
+        assert_eq!(ri.current_ring, 1);
+        assert_eq!(ri.joiner_ring, 1);
+        assert_eq!(ri.active_on_current_ring, 1);
+        assert_eq!(ri.active_on_joiner_ring, 2);
+    }
+
+    #[test]
+    fn ring_info_16_provers() {
+        let ri = compute_shard_ring_info(16);
+        assert_eq!(ri.current_ring, 1);
+        assert_eq!(ri.joiner_ring, 2);
+        assert_eq!(ri.active_on_current_ring, 8);
+        assert_eq!(ri.active_on_joiner_ring, 1);
+    }
+
+    #[test]
+    fn pomw_basis_nonzero() {
+        let b = pomw_basis(50000, 10_000_000_000, DEFAULT_UNITS);
+        assert!(b > BigInt::zero(), "basis should be positive");
+    }
+
+    #[test]
+    fn score_empty_shards() {
+        let scores = score_shards(
+            &[],
+            &BigInt::from(1),
+            &BigInt::from(1),
+            Strategy::RewardGreedy,
+        );
+        assert!(scores.is_empty());
+    }
+
+    #[test]
+    fn score_data_greedy_by_size() {
+        let shards = vec![
+            ShardDescriptor {
+                filter: vec![1],
+                size: 100,
+                ring: 0,
+                shards: 1,
+                active_on_ring: 1,
+                total_active_joining: 16,
+                active_count: 16,
+                activating_count: 0,
+            },
+            ShardDescriptor {
+                filter: vec![2],
+                size: 200,
+                ring: 0,
+                shards: 1,
+                active_on_ring: 1,
+                total_active_joining: 16,
+                active_count: 16,
+                activating_count: 0,
+            },
+        ];
+        let scores = score_shards(
+            &shards,
+            &BigInt::from(1),
+            &BigInt::from(1),
+            Strategy::DataGreedy,
+        );
+        assert_eq!(scores.len(), 2);
+        assert_eq!(scores[0].score, BigInt::from(100));
+        assert_eq!(scores[1].score, BigInt::from(200));
+    }
+
+    /// Data-greedy and reward-greedy must produce DIFFERENT picking
+    /// orders on inputs where the two metrics diverge. Reward-greedy
+    /// divides by `2^(ring+1)`, so a big shard at a high enough ring
+    /// loses to a smaller low-ring shard. Data-greedy ignores ring
+    /// and picks the biggest. This pins the behavioral split that
+    /// the `Strategy` flag exists to express — regressing it would
+    /// silently make both strategies behave the same and the
+    /// operator's choice would stop mattering.
+    #[test]
+    fn strategies_diverge_when_ring_and_size_disagree() {
+        // Size ratio 100×; ring penalty ratio 2^9 / 2 = 256×.
+        // Reward-greedy: big = 1_000_000 / 512 ≈ 1953;
+        //                small = 10_000 / 2 = 5000 → small wins.
+        // Data-greedy: 1_000_000 > 10_000 → big wins.
+        let big_high_ring = ShardDescriptor {
+            filter: vec![0xAA],
+            size: 1_000_000,
+            ring: 8, // divisor = 2^9 = 512
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 16,
+            active_count: 16,
+            activating_count: 0,
+        };
+        let small_low_ring = ShardDescriptor {
+            filter: vec![0xBB],
+            size: 10_000,
+            ring: 0, // divisor = 2
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 16,
+            active_count: 16,
+            activating_count: 0,
+        };
+        let shards = vec![big_high_ring, small_low_ring];
+        let basis = BigInt::from(1u64) << 50;
+        let world_bytes = BigInt::from(1u64) << 30;
+
+        // Data-greedy: score = size, so the big shard wins.
+        let data_scored = score_shards(&shards, &basis, &world_bytes, Strategy::DataGreedy);
+        assert_eq!(data_scored[0].score, BigInt::from(1_000_000u64));
+        assert_eq!(data_scored[1].score, BigInt::from(10_000u64));
+        let data_winner = data_scored
+            .iter()
+            .max_by(|a, b| a.score.cmp(&b.score))
+            .unwrap()
+            .idx;
+        assert_eq!(data_winner, 0, "data-greedy picks the big shard");
+
+        // Reward-greedy: the ring penalty beats the size advantage.
+        let reward_scored = score_shards(&shards, &basis, &world_bytes, Strategy::RewardGreedy);
+        let reward_winner = reward_scored
+            .iter()
+            .max_by(|a, b| a.score.cmp(&b.score))
+            .unwrap()
+            .idx;
+        assert_eq!(
+            reward_winner, 1,
+            "reward-greedy picks the small low-ring shard"
+        );
+
+        // The winners are DIFFERENT — the strategy flag matters.
+        assert_ne!(data_winner, reward_winner);
+    }
+
+    /// Inputs where size and ring agree on the same winner: both
+    /// strategies converge. Pins the no-divergence regime so a
+    /// future scoring tweak that *adds* divergence here would also
+    /// be caught.
+    #[test]
+    fn strategies_agree_when_ring_and_size_align() {
+        // Both shards at ring=0; size differs. Reward-greedy and
+        // data-greedy should agree on which is better.
+        let big = ShardDescriptor {
+            filter: vec![0xAA],
+            size: 1_000_000,
+            ring: 0,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 16,
+            active_count: 16,
+            activating_count: 0,
+        };
+        let small = ShardDescriptor {
+            filter: vec![0xBB],
+            size: 10_000,
+            ring: 0,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 16,
+            active_count: 16,
+            activating_count: 0,
+        };
+        let shards = vec![big, small];
+        let basis = BigInt::from(1u64) << 50;
+        let world_bytes = BigInt::from(1u64) << 30;
+
+        for strategy in [Strategy::DataGreedy, Strategy::RewardGreedy] {
+            let scored = score_shards(&shards, &basis, &world_bytes, strategy);
+            let winner = scored
+                .iter()
+                .max_by(|a, b| a.score.cmp(&b.score))
+                .unwrap()
+                .idx;
+            assert_eq!(
+                winner, 0,
+                "{strategy:?} should pick the big shard when ring matches"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_joins_all_reject_when_no_valid_scores() {
+        let pending = vec![vec![1, 2, 3]];
+        let (reject, confirm) = decide_joins(
+            &[],
+            &pending,
+            50000,
+            &BigInt::from(1_000_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            usize::MAX,
+        );
+        assert_eq!(reject.len(), 1);
+        assert!(confirm.is_empty());
+    }
+
+    #[test]
+    fn plan_leaves_empty_when_no_unallocated() {
+        let allocated = vec![ShardDescriptor {
+            filter: vec![1],
+            size: 100,
+            ring: 0,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 16,
+            active_count: 16,
+            activating_count: 0,
+        }];
+        let result = plan_leaves(
+            &allocated,
+            &[],
+            50000,
+            &BigInt::from(1_000_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
+        );
+        assert!(result.is_empty());
+    }
+
+    fn make_shard(filter: Vec<u8>, size: u64, ring: u8, shards: u64) -> ShardDescriptor {
+        // Default `total_active_joining` and `active_count` = 16 so
+        // the shard is NOT
+        // halt-risk in tests that don't care about that bucket.
+        ShardDescriptor {
+            filter,
+            size,
+            ring,
+            shards,
+            active_on_ring: 1,
+            total_active_joining: 16,
+            active_count: 16,
+            activating_count: 0,
+        }
+    }
+
+    #[test]
+    fn one_destination_confirms_only_one_worst_pending_leave() {
+        let held = vec![
+            make_shard(vec![1], 100, 0, 1),
+            make_shard(vec![2], 10, 0, 1),
+        ];
+        let available = vec![make_shard(vec![3], 10_000, 0, 1)];
+        let pending = vec![vec![1], vec![2]];
+        let (reject, confirm) = decide_leaves_against_replacements(
+            &held,
+            &available,
+            &pending,
+            1,
+            &BigInt::from(10_110),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+        );
+        assert_eq!(confirm, vec![vec![2]]);
+        assert_eq!(reject, vec![vec![1]]);
+        // Existing global-best policy confirms both through the same API.
+        let mut all = held.clone();
+        all.extend(available);
+        let (_, old_confirm) = decide_leaves(
+            &all,
+            &pending,
+            1,
+            &BigInt::from(10_110),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+        );
+        assert_eq!(old_confirm.len(), 2);
+    }
+
+    #[test]
+    fn plan_and_allocate_prefers_halt_risk_over_higher_reward() {
+        // A high-size, healthy (8-prover) shard would normally
+        // outscore a small 3-prover shard. Verify the halt-risk
+        // bucket pulls the 3-prover shard ahead of it.
+        let healthy = ShardDescriptor {
+            filter: vec![1],
+            size: 10_000_000,
+            ring: 1,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 8,
+            active_count: 8,
+            activating_count: 0,
+        };
+        let halt_risk = ShardDescriptor {
+            filter: vec![2],
+            size: 1_000_000,
+            ring: 0,
+            shards: 1,
+            active_on_ring: 4,
+            total_active_joining: 3,
+            active_count: 3,
+            activating_count: 0,
+        };
+        let result = plan_and_allocate(
+            &[healthy, halt_risk],
+            50_000,
+            &BigInt::from(20_000_000u64),
+            DEFAULT_UNITS,
+            &[1],
+            1,
+            Strategy::RewardGreedy,
+            None,
+        );
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].filter,
+            vec![2],
+            "halt-risk shard must be picked first"
+        );
+    }
+
+    #[test]
+    fn plan_and_allocate_falls_back_to_reward_after_halt_risk_filled() {
+        // Two halt-risk shards + one healthy. With 3 free workers and
+        // max_allocations=3, all three should be picked. Halt-risk
+        // first, healthy last.
+        let healthy = ShardDescriptor {
+            filter: vec![3],
+            size: 10_000_000,
+            ring: 1,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 8,
+            active_count: 8,
+            activating_count: 0,
+        };
+        let halt_a = ShardDescriptor {
+            filter: vec![1],
+            size: 500_000,
+            ring: 0,
+            shards: 1,
+            active_on_ring: 2,
+            total_active_joining: 1,
+            active_count: 1,
+            activating_count: 0,
+        };
+        let halt_b = ShardDescriptor {
+            filter: vec![2],
+            size: 700_000,
+            ring: 0,
+            shards: 1,
+            active_on_ring: 3,
+            total_active_joining: 2,
+            active_count: 2,
+            activating_count: 0,
+        };
+        let result = plan_and_allocate(
+            &[healthy, halt_a, halt_b],
+            50_000,
+            &BigInt::from(20_000_000u64),
+            DEFAULT_UNITS,
+            &[1, 2, 3],
+            3,
+            Strategy::RewardGreedy,
+            None,
+        );
+        assert_eq!(result.len(), 3);
+        // First two picks must be the halt-risk shards (order between
+        // them depends on score; both fall in the halt-risk bucket).
+        let first_two: std::collections::HashSet<Vec<u8>> =
+            result[0..2].iter().map(|p| p.filter.clone()).collect();
+        assert!(first_two.contains(&vec![1u8]));
+        assert!(first_two.contains(&vec![2u8]));
+        assert_eq!(result[2].filter, vec![3], "healthy shard last");
+    }
+
+    #[test]
+    fn plan_and_allocate_skips_zero_size_halt_risk_shards() {
+        // size=0 must NOT be promoted into the halt-risk bucket —
+        // a shard with no data isn't worth saving.
+        let zero_halt = ShardDescriptor {
+            filter: vec![1],
+            size: 0,
+            ring: 0,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 1,
+            active_count: 1,
+            activating_count: 0,
+        };
+        let normal = ShardDescriptor {
+            filter: vec![2],
+            size: 100_000,
+            ring: 0,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 16,
+            active_count: 16,
+            activating_count: 0,
+        };
+        let result = plan_and_allocate(
+            &[zero_halt, normal],
+            50_000,
+            &BigInt::from(1_000_000u64),
+            DEFAULT_UNITS,
+            &[1],
+            1,
+            Strategy::RewardGreedy,
+            None,
+        );
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].filter, vec![2]);
+    }
+
+    #[test]
+    fn plan_and_allocate_unequal_scores_picks_max() {
+        let best = make_shard(vec![0x0A], 200_000, 0, 1);
+        let other1 = make_shard(vec![0x01], 50_000, 0, 1);
+        let other2 = make_shard(vec![0x02], 50_000, 0, 1);
+        let shards = vec![other1, other2, best];
+
+        let proposals = plan_and_allocate(
+            &shards,
+            50000,
+            &BigInt::from(300_000),
+            1,
+            &[1],
+            1,
+            Strategy::RewardGreedy,
+            None,
+        );
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(
+            proposals[0].filter,
+            vec![0x0A],
+            "best shard 0x0A should be selected"
+        );
+    }
+
+    #[test]
+    fn post_v5_normal_node_proposes_joins_to_sentinel_grid() {
+        // DIAGNOSTIC (post-v5 "no joins landed"): a normal node with free
+        // workers and NO allocations, facing the post-v5 mainnet grid — 64-way
+        // SENTINEL shards that carry committed coin data (size>0) but have zero
+        // provers on them (active_count=0 ⇒ halt-risk). This is exactly the state
+        // right after the v5 wipe. If `plan_and_allocate` returns EMPTY here, the
+        // planner never proposes a join and the network can't refill — the
+        // observed wedge. Uses the REAL sentinel filters the grid produces.
+        let quil = [0x11u8; 32];
+        let sentinel_prefixes = quil_forest::genesis_grid_prefixes(0);
+        assert_eq!(sentinel_prefixes.len(), 64);
+        let shards: Vec<ShardDescriptor> = sentinel_prefixes
+            .iter()
+            .map(|p| {
+                let filter = quil_forest::shard_prefix_to_filter(&quil, p);
+                assert_eq!(
+                    filter.len(),
+                    35,
+                    "genesis grid filter must be sentinel (35B)"
+                );
+                ShardDescriptor {
+                    filter,
+                    size: 100_000,
+                    ring: 0,
+                    shards: 1,
+                    active_on_ring: 0,
+                    total_active_joining: 0,
+                    active_count: 0,
+                    activating_count: 0,
+                }
+            })
+            .collect();
+
+        let free_workers: Vec<u32> = (1..=14).collect();
+        let proposals = plan_and_allocate(
+            &shards,
+            50_000,
+            &BigInt::from(6_400_000u64),
+            DEFAULT_UNITS,
+            &free_workers,
+            free_workers.len(),
+            Strategy::RewardGreedy,
+            None,
+        );
+
+        assert!(
+            !proposals.is_empty(),
+            "a node with 14 free workers MUST propose joins to the 64-way sentinel grid post-v5"
+        );
+        for p in &proposals {
+            assert_eq!(
+                p.filter.len(),
+                35,
+                "proposed join filter must be a sentinel (35B) grid filter"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_and_allocate_data_greedy_deterministic_lexicographic() {
+        let shards = vec![
+            make_shard(vec![0x02], 10_000, 0, 1),
+            make_shard(vec![0x01], 10_000, 0, 1),
+            make_shard(vec![0x04], 10_000, 0, 1),
+            make_shard(vec![0x03], 10_000, 0, 1),
+        ];
+        for _ in 0..16 {
+            let proposals = plan_and_allocate(
+                &shards,
+                50000,
+                &BigInt::from(40_000),
+                1,
+                &[1],
+                1,
+                Strategy::DataGreedy,
+                None,
+            );
+            assert_eq!(proposals.len(), 1);
+            assert_eq!(
+                proposals[0].filter,
+                vec![0x01],
+                "DataGreedy with equal sizes should pick lexicographic first (0x01)"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_joins_confirm_when_best_reward_greedy() {
+        let shards = vec![
+            make_shard(vec![0x01], 50_000, 0, 1),
+            make_shard(vec![0x02], 200_000, 0, 1),
+            make_shard(vec![0x03], 50_000, 0, 1),
+        ];
+        let pending = vec![vec![0x02]];
+        let (reject, confirm) = decide_joins(
+            &shards,
+            &pending,
+            50000,
+            &BigInt::from(300_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            usize::MAX,
+        );
+        assert!(reject.is_empty(), "best shard should not be rejected");
+        assert_eq!(confirm.len(), 1);
+        assert_eq!(confirm[0], vec![0x02]);
+    }
+
+    #[test]
+    fn decide_joins_reject_when_better_exists_reward_greedy() {
+        let shards = vec![
+            make_shard(vec![0x0A], 200_000, 0, 1),
+            make_shard(vec![0x01], 50_000, 0, 1),
+        ];
+        let pending = vec![vec![0x01]];
+        let (reject, confirm) = decide_joins(
+            &shards,
+            &pending,
+            50000,
+            &BigInt::from(250_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            usize::MAX,
+        );
+        assert_eq!(reject.len(), 1);
+        assert_eq!(reject[0], vec![0x01], "inferior shard should be rejected");
+        assert!(confirm.is_empty());
+    }
+
+    #[test]
+    fn decide_joins_tie_confirms_reward_greedy() {
+        let shards = vec![
+            make_shard(vec![0x01], 100_000, 1, 4),
+            make_shard(vec![0x02], 100_000, 1, 4),
+        ];
+        let pending = vec![vec![0x02]];
+        let (reject, confirm) = decide_joins(
+            &shards,
+            &pending,
+            50000,
+            &BigInt::from(200_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            usize::MAX,
+        );
+        assert!(reject.is_empty(), "tied shard should not be rejected");
+        assert_eq!(confirm.len(), 1);
+        assert_eq!(confirm[0], vec![0x02]);
+    }
+
+    #[test]
+    fn decide_joins_data_greedy_size_only() {
+        let shards = vec![
+            make_shard(vec![0xAA], 10_000, 3, 16),
+            make_shard(vec![0xBB], 80_000, 0, 1),
+            make_shard(vec![0xCC], 80_000, 5, 64),
+        ];
+        let pending = vec![vec![0xAA], vec![0xBB], vec![0xCC]];
+        let (reject, confirm) = decide_joins(
+            &shards,
+            &pending,
+            50000,
+            &BigInt::from(170_000),
+            DEFAULT_UNITS,
+            Strategy::DataGreedy,
+            usize::MAX,
+        );
+        let reject_hex: Vec<String> = reject.iter().map(hex::encode).collect();
+        let confirm_hex: Vec<String> = confirm.iter().map(hex::encode).collect();
+        assert!(
+            reject_hex.contains(&"aa".to_string()),
+            "aa should be rejected; got reject={reject_hex:?} confirm={confirm_hex:?}"
+        );
+        assert!(
+            !reject_hex.contains(&"bb".to_string()),
+            "bb should not be rejected"
+        );
+        assert!(
+            !reject_hex.contains(&"cc".to_string()),
+            "cc should not be rejected"
+        );
+    }
+
+    #[test]
+    fn decide_joins_pending_missing_or_invalid_reject() {
+        let shards = vec![make_shard(vec![0x01], 100_000, 0, 1)];
+        let pending = vec![vec![0xDE, 0xAD, 0xBE, 0xEF]];
+        let (reject, confirm) = decide_joins(
+            &shards,
+            &pending,
+            50000,
+            &BigInt::from(100_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            usize::MAX,
+        );
+        assert!(confirm.is_empty());
+        assert_eq!(reject.len(), 1);
+        assert_eq!(reject[0], vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    /// When no rejections, confirms cap at `available_workers`.
+    /// `0` workers → reject every join; `N` workers → confirm N, reject the
+    /// rest.
+    #[test]
+    fn decide_joins_caps_confirms_by_available_workers() {
+        let shards = vec![
+            make_shard(vec![0x01], 100_000, 0, 1),
+            make_shard(vec![0x02], 100_000, 0, 1),
+            make_shard(vec![0x03], 100_000, 0, 1),
+        ];
+        let pending = vec![vec![0x01], vec![0x02], vec![0x03]];
+
+        // available_workers = 0 → every join rejected.
+        let (reject0, confirm0) = decide_joins(
+            &shards,
+            &pending,
+            50000,
+            &BigInt::from(300_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            0,
+        );
+        assert_eq!(reject0.len(), 3, "no workers → every join rejected");
+        assert!(confirm0.is_empty(), "no workers → no confirms");
+
+        // available_workers = 1 → exactly 1 confirm, the others rejected.
+        let (reject1, confirm1) = decide_joins(
+            &shards,
+            &pending,
+            50000,
+            &BigInt::from(300_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            1,
+        );
+        assert_eq!(reject1.len(), 2);
+        assert_eq!(confirm1.len(), 1);
+
+        // usize::MAX disables the cap (parity with prior behavior).
+        let (_, confirm_max) = decide_joins(
+            &shards,
+            &pending,
+            50000,
+            &BigInt::from(300_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            usize::MAX,
+        );
+        assert_eq!(confirm_max.len(), 3);
+    }
+
+    #[test]
+    fn decide_joins_capacity_keeps_highest_reward_pending_filters() {
+        // Pending allocation order is deliberately worst-to-best. With one
+        // worker available, the cap must not confirm the first registry entry.
+        let shards = vec![
+            make_shard(vec![0x01], 200_000, 0, 1),
+            make_shard(vec![0x02], 250_000, 0, 1),
+            make_shard(vec![0x03], 300_000, 0, 1),
+        ];
+        let pending = vec![vec![0x01], vec![0x02], vec![0x03]];
+
+        let (reject, confirm) = decide_joins(
+            &shards,
+            &pending,
+            50_000,
+            &BigInt::from(750_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            1,
+        );
+
+        assert_eq!(
+            reject,
+            vec![vec![0x02], vec![0x01]],
+            "the others are rejected, not left to lapse"
+        );
+        assert_eq!(
+            confirm,
+            vec![vec![0x03]],
+            "highest-reward shard wins the only slot"
+        );
+    }
+
+    /// A join rejected on score does not lift the worker cap from the rest.
+    #[test]
+    fn decide_joins_caps_confirms_when_another_join_is_rejected() {
+        let shards = vec![
+            make_shard(vec![0x01], 10_000, 0, 1),
+            make_shard(vec![0x02], 300_000, 0, 1),
+            make_shard(vec![0x03], 300_000, 0, 1),
+        ];
+        let pending = vec![vec![0x01], vec![0x02], vec![0x03]];
+        let (reject, confirm) = decide_joins(
+            &shards,
+            &pending,
+            50_000,
+            &BigInt::from(610_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            1,
+        );
+        assert_eq!(confirm.len(), 1, "one worker: {confirm:?}");
+        assert_eq!(
+            reject.len(),
+            2,
+            "the low score and the one above the cap: {reject:?}"
+        );
+        assert!(reject.contains(&vec![0x01]));
+    }
+
+    // In score order every freed worker goes to the same empty shard.
+    // Each node takes the halt-risk shards in its own order; reward
+    // order still applies outside the halt-risk bucket.
+    #[test]
+    fn nodes_spread_over_the_halt_risk_shards() {
+        let shards: Vec<ShardDescriptor> = (1u8..=4)
+            .map(|b| ShardDescriptor {
+                total_active_joining: 0,
+                active_count: 0,
+                activating_count: 0,
+                ..make_shard(vec![b], 100_000 * b as u64, 0, 1)
+            })
+            .chain([make_shard(vec![0x10], 10_000_000, 1, 1)])
+            .collect();
+        let pick = |spread: Option<&[u8]>| {
+            plan_and_allocate(
+                &shards,
+                50_000,
+                &BigInt::from(20_000_000u64),
+                DEFAULT_UNITS,
+                &[1],
+                1,
+                Strategy::RewardGreedy,
+                spread,
+            )[0]
+            .filter
+            .clone()
+        };
+        assert_eq!(
+            pick(None),
+            vec![4],
+            "score order: the largest halt-risk shard"
+        );
+        let provers: Vec<Vec<u8>> = (0u8..12).map(|b| vec![b; 32]).collect();
+        let picked: std::collections::HashSet<Vec<u8>> =
+            provers.iter().map(|p| pick(Some(p))).collect();
+        assert!(
+            picked.len() > 1,
+            "twelve nodes do not all take the same shard"
+        );
+        assert!(
+            !picked.contains(&vec![0x10]),
+            "halt-risk shards still come first"
+        );
+    }
+
+    /// Halt-risk priority goes to shards their live joins do not staff.
+    /// Halt-risk is still `active` only, so a shard short of active provers
+    /// with too few joiners to close the gap keeps priority (the regression
+    /// where 107 real halt-risk shards were masked by joiners). Once its
+    /// joiners cover the gap, `decide_joins` confirms them regardless of
+    /// score, so the shard stops drawing every node's free workers: after a
+    /// split, a child with 3 active and 51 joining still drew more.
+    #[test]
+    fn plan_and_allocate_prioritizes_halt_risk_shards_their_joins_do_not_staff() {
+        let shard = |filter: u8, size: u64, active: u64, total: u64| ShardDescriptor {
+            filter: vec![filter],
+            size,
+            ring: 1,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: total,
+            active_count: active,
+            activating_count: 0,
+        };
+        let healthy = shard(0xBB, 10_000_000, 8, 8);
+        let pick = |candidate: ShardDescriptor| {
+            plan_and_allocate(
+                &[healthy.clone(), candidate],
+                50_000,
+                &BigInt::from(20_000_000u64),
+                DEFAULT_UNITS,
+                &[1],
+                1,
+                Strategy::RewardGreedy,
+                None,
+            )[0]
+            .filter
+            .clone()
+        };
+        assert_eq!(
+            pick(shard(0xAA, 1_000_000, 2, 3)),
+            vec![0xAA],
+            "2 active and 1 joining stay short of the target: halt-risk first"
+        );
+        assert_eq!(
+            pick(shard(0xAA, 1_000_000, 2, 12)),
+            vec![0xBB],
+            "10 joiners already cover the gap: scored like any other shard"
+        );
+        assert!(halt_risk_unstaffed(&shard(0xAA, 1, 0, 3)));
+        assert!(!halt_risk_unstaffed(&shard(0xAA, 1, 0, HALT_RISK_TARGET)));
+        assert!(
+            !halt_risk_unstaffed(&shard(0xAA, 0, 0, 0)),
+            "no data, no priority"
+        );
+    }
+
+    /// Halt-risk pending shard with score below the 67% threshold is
+    /// CONFIRMED, not rejected. Mirrors `plan_and_allocate`'s halt-risk
+    /// priority so the propose→confirm pipeline stays coherent.
+    #[test]
+    fn decide_joins_confirms_halt_risk_below_threshold() {
+        // 0xBB is a big healthy shard (high score), 0xAA is a tiny
+        // halt-risk shard (low score, 2 provers).
+        let shards = vec![
+            ShardDescriptor {
+                filter: vec![0xAA],
+                size: 5_000,
+                ring: 0,
+                shards: 1,
+                active_on_ring: 1,
+                total_active_joining: 2, // ← halt-risk (≤ HALT_RISK_PROVER_COUNT)
+                active_count: 2,
+                activating_count: 0,
+            },
+            ShardDescriptor {
+                filter: vec![0xBB],
+                size: 500_000,
+                ring: 0,
+                shards: 1,
+                active_on_ring: 1,
+                total_active_joining: 16,
+                active_count: 16,
+                activating_count: 0,
+            },
+        ];
+        let pending = vec![vec![0xAA]];
+        let (reject, confirm) = decide_joins(
+            &shards,
+            &pending,
+            50000,
+            &BigInt::from(600_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            usize::MAX,
+        );
+        assert!(
+            reject.is_empty(),
+            "halt-risk pending should bypass the 67% threshold; got reject={reject:?}"
+        );
+        assert_eq!(confirm, vec![vec![0xAA]]);
+    }
+
+    /// Confirmed joins staff a shard: once its Active members and confirmed
+    /// joins exceed the halt-risk count, a pending join there is judged by
+    /// score like any other, while one confirmed join that leaves the shard
+    /// at the count keeps the bypass.
+    #[test]
+    fn decide_joins_counts_confirmed_joins_against_the_halt_risk_bypass() {
+        let shards = |activating_count| {
+            vec![
+                ShardDescriptor {
+                    filter: vec![0xAA],
+                    size: 5_000,
+                    ring: 0,
+                    shards: 1,
+                    active_on_ring: 1,
+                    total_active_joining: 2 + activating_count,
+                    active_count: 2,
+                    activating_count,
+                },
+                ShardDescriptor {
+                    filter: vec![0xBB],
+                    size: 500_000,
+                    ring: 0,
+                    shards: 1,
+                    active_on_ring: 1,
+                    total_active_joining: 16,
+                    active_count: 16,
+                    activating_count: 0,
+                },
+            ]
+        };
+        let decide = |activating_count| {
+            decide_joins(
+                &shards(activating_count),
+                &[vec![0xAA]],
+                50000,
+                &BigInt::from(600_000),
+                DEFAULT_UNITS,
+                Strategy::RewardGreedy,
+                usize::MAX,
+            )
+        };
+        assert_eq!(
+            decide(1),
+            (Vec::new(), vec![vec![0xAA]]),
+            "two Active and one confirmed join: still halt risk"
+        );
+        assert_eq!(
+            decide(2),
+            (vec![vec![0xAA]], Vec::new()),
+            "four members at the boundary: judged by score"
+        );
+    }
+
+    /// Halt-risk bypass requires size > 0 — a halt-risk-by-prover-count
+    /// shard with zero data shouldn't be confirmed (no point allocating
+    /// a worker to a shard with nothing to prove).
+    #[test]
+    fn decide_joins_does_not_confirm_zero_size_halt_risk() {
+        let shards = vec![
+            ShardDescriptor {
+                filter: vec![0xAA],
+                size: 0, // ← no data
+                ring: 0,
+                shards: 1,
+                active_on_ring: 1,
+                total_active_joining: 2, // halt-risk by count
+                active_count: 2,
+                activating_count: 0,
+            },
+            ShardDescriptor {
+                filter: vec![0xBB],
+                size: 500_000,
+                ring: 0,
+                shards: 1,
+                active_on_ring: 1,
+                total_active_joining: 16,
+                active_count: 16,
+                activating_count: 0,
+            },
+        ];
+        let pending = vec![vec![0xAA]];
+        let (reject, confirm) = decide_joins(
+            &shards,
+            &pending,
+            50000,
+            &BigInt::from(600_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            usize::MAX,
+        );
+        assert_eq!(
+            reject,
+            vec![vec![0xAA]],
+            "zero-size halt-risk should still be rejected; got confirm={confirm:?}"
+        );
+        assert!(confirm.is_empty());
+    }
+
+    // The swap sheds healthy holdings only for halt-risk shards their live
+    // joins leave short: after a split, every node shed holdings for a child
+    // that already had 51 joiners.
+    #[test]
+    fn swap_demand_counts_only_halt_risk_shards_their_joins_leave_short() {
+        let shard = |filter: u8, active: u64, total: u64| ShardDescriptor {
+            filter: vec![filter],
+            size: 1_000,
+            ring: 0,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: total,
+            active_count: active,
+            activating_count: 0,
+        };
+        let short = shard(0xB0, 1, 2);
+        let staffed = shard(0xB1, 1, 40);
+        assert_eq!(
+            halt_risk_swap_demand(&[short.clone(), staffed.clone()], 0),
+            1
+        );
+        assert_eq!(halt_risk_swap_demand(&[staffed.clone()], 0), 0);
+        assert_eq!(
+            halt_risk_swap_demand(&[short.clone()], 1),
+            0,
+            "a free worker covers it"
+        );
+
+        // A healthy holding is shed for the short shard, not the staffed one.
+        let held = shard(0xA0, 10, 10);
+        let shed = |waiting: ShardDescriptor| {
+            plan_leaves(
+                &[held.clone()],
+                &[waiting],
+                50000,
+                &BigInt::from(250_000),
+                DEFAULT_UNITS,
+                Strategy::RewardGreedy,
+                0,
+                &std::collections::HashSet::<Vec<u8>>::new(),
+            )
+        };
+        assert_eq!(shed(short), vec![vec![0xA0]]);
+        assert!(shed(staffed).is_empty());
+    }
+
+    #[test]
+    fn plan_leaves_leaves_when_better_exists() {
+        let allocated = vec![make_shard(vec![0xAA], 50_000, 3, 1)];
+        let unallocated = vec![make_shard(vec![0xBB], 200_000, 0, 1)];
+        let filters = plan_leaves(
+            &allocated,
+            &unallocated,
+            50000,
+            &BigInt::from(250_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
+        );
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0], vec![0xAA]);
+    }
+
+    #[test]
+    fn paired_leaves_follow_the_next_allocator_candidate() {
+        let allocated = vec![make_shard(vec![0xA1], 50_000, 0, 1)];
+        let unallocated = vec![
+            make_shard(vec![0xB1], 500_000, 0, 1),
+            ShardDescriptor {
+                active_count: 2,
+                activating_count: 0,
+                total_active_joining: 2,
+                ..make_shard(vec![0xB2], 90_000, 0, 1)
+            },
+        ];
+        let joins = plan_and_allocate(
+            &unallocated,
+            50_000,
+            &BigInt::from(700_000),
+            DEFAULT_UNITS,
+            &[0],
+            1,
+            Strategy::DataGreedy,
+            None,
+        );
+        assert_eq!(joins[0].filter, vec![0xB2]);
+        let leaves = plan_leaves(
+            &allocated,
+            &unallocated,
+            50_000,
+            &BigInt::from(700_000),
+            DEFAULT_UNITS,
+            Strategy::DataGreedy,
+            1,
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            leaves.is_empty(),
+            "the next admission cannot justify a score leave"
+        );
+    }
+
+    #[test]
+    fn paired_leaves_use_the_allocators_per_node_spread() {
+        let allocated = vec![make_shard(vec![0xA1], 50_000, 0, 1)];
+        let unallocated = vec![
+            ShardDescriptor {
+                active_count: 2,
+                activating_count: 0,
+                total_active_joining: 2,
+                ..make_shard(vec![0xB1], 90_000, 0, 1)
+            },
+            ShardDescriptor {
+                active_count: 2,
+                activating_count: 0,
+                total_active_joining: 2,
+                ..make_shard(vec![0xB2], 200_000, 0, 1)
+            },
+        ];
+        let mut outcomes = std::collections::HashSet::new();
+        for b in 0u8..32 {
+            let prover = vec![b; 32];
+            let joins = plan_and_allocate(
+                &unallocated,
+                50_000,
+                &BigInt::from(400_000),
+                DEFAULT_UNITS,
+                &[0],
+                1,
+                Strategy::DataGreedy,
+                Some(&prover),
+            );
+            let expected = joins[0].filter == vec![0xB2];
+            let leaves = plan_leaves_releasing_spread(
+                &allocated,
+                &unallocated,
+                50_000,
+                &BigInt::from(400_000),
+                DEFAULT_UNITS,
+                Strategy::DataGreedy,
+                2,
+                &std::collections::HashSet::new(),
+                &|_| true,
+                Some(&prover),
+            )
+            .filters;
+            assert_eq!(
+                !leaves.is_empty(),
+                expected,
+                "score leaves must use the same admission order as joins"
+            );
+            outcomes.insert(expected);
+        }
+        assert_eq!(outcomes.len(), 2, "exercise both admission orders");
+    }
+
+    #[test]
+    fn paired_leaves_keep_the_strict_replacement_margin_and_dwell() {
+        let unallocated = vec![make_shard(vec![0xB1], 100_000, 0, 1)];
+        for (size, held, expected) in [
+            (39_999, false, true),
+            (40_000, false, false),
+            (40_001, false, false),
+            (39_999, true, false),
+        ] {
+            let allocated = vec![make_shard(vec![0xA1], size, 0, 1)];
+            let hold = if held {
+                [vec![0xA1]].into_iter().collect()
+            } else {
+                std::collections::HashSet::new()
+            };
+            let leaves = plan_leaves(
+                &allocated,
+                &unallocated,
+                50_000,
+                &BigInt::from(200_000),
+                DEFAULT_UNITS,
+                Strategy::DataGreedy,
+                0,
+                &hold,
+            );
+            assert_eq!(!leaves.is_empty(), expected);
+        }
+    }
+
+    #[test]
+    fn score_replacement_pairs_one_candidate_with_one_holding() {
+        let allocated = vec![
+            make_shard(vec![0xA1], 20_000, 0, 1),
+            make_shard(vec![0xA2], 30_000, 0, 1),
+            make_shard(vec![0xA3], 40_000, 0, 1),
+        ];
+        let unallocated = vec![make_shard(vec![0xB1], 200_000, 0, 1)];
+        let replacements = plan_score_replacements(
+            &allocated,
+            &unallocated,
+            50_000,
+            &BigInt::from(300_000),
+            DEFAULT_UNITS,
+            Strategy::DataGreedy,
+            &std::collections::HashSet::<Vec<u8>>::new(),
+        );
+        assert_eq!(
+            replacements.len(),
+            1,
+            "one candidate can justify replacing only one allocation"
+        );
+        assert_eq!(replacements[0].leave_filter, vec![0xA1]);
+        assert_eq!(replacements[0].join_filter, vec![0xB1]);
+    }
+
+    #[test]
+    fn score_replacement_uses_allocator_admission_priority() {
+        let allocated = vec![make_shard(vec![0xA1], 50_000, 0, 1)];
+        let unallocated = vec![
+            // This is globally the most rewarding shard, but the allocator
+            // must admit the halt-risk candidate first.
+            make_shard(vec![0xB1], 500_000, 0, 1),
+            ShardDescriptor {
+                filter: vec![0xB2],
+                size: 90_000,
+                ring: 0,
+                shards: 1,
+                active_on_ring: 1,
+                total_active_joining: 2,
+                active_count: 2,
+                activating_count: 0,
+            },
+        ];
+        let replacements = plan_score_replacements(
+            &allocated,
+            &unallocated,
+            50_000,
+            &BigInt::from(700_000),
+            DEFAULT_UNITS,
+            Strategy::DataGreedy,
+            &std::collections::HashSet::<Vec<u8>>::new(),
+        );
+        assert!(
+            replacements.is_empty(),
+            "the global maximum must not evict A when the next bindable B is not 2.5x better"
+        );
+    }
+
+    #[test]
+    fn score_replacement_prices_the_predicted_joiner_ring() {
+        let allocated = vec![make_shard(vec![0xA1], 30_000, 0, 1)];
+        // Raw size is attractive, but a predicted ring 2 divides its reward
+        // budget by eight. The conservative admission score is not enough to
+        // clear the retained 40% replacement rule.
+        let unallocated = vec![make_shard(vec![0xB1], 200_000, 2, 1)];
+        let replacements = plan_score_replacements(
+            &allocated,
+            &unallocated,
+            50_000,
+            &BigInt::from(230_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            &std::collections::HashSet::<Vec<u8>>::new(),
+        );
+        assert!(
+            replacements.is_empty(),
+            "the admission-ring penalty must veto a marginal replacement"
+        );
+    }
+
+    #[test]
+    fn plan_leaves_dwell_exempts_recently_confirmed() {
+        // Anti-churn dwell: a below-threshold allocation listed in
+        // `min_hold_filters` (confirmed too recently) is NOT a score-leave
+        // candidate, even though the same shard would otherwise be shed.
+        let allocated = vec![make_shard(vec![0xAA], 50_000, 3, 1)]; // ring 3, low
+        let unallocated = vec![make_shard(vec![0xBB], 200_000, 0, 1)]; // ring 0, high
+
+        // No dwell → the weak allocation is shed.
+        let none = std::collections::HashSet::<Vec<u8>>::new();
+        let picked = plan_leaves(
+            &allocated,
+            &unallocated,
+            50000,
+            &BigInt::from(250_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            0,
+            &none,
+        );
+        assert_eq!(
+            picked,
+            vec![vec![0xAA]],
+            "below-threshold alloc leaves without dwell"
+        );
+
+        // Dwell exemption on 0xAA → held despite scoring below threshold.
+        let hold: std::collections::HashSet<Vec<u8>> = [vec![0xAAu8]].into_iter().collect();
+        let picked = plan_leaves(
+            &allocated,
+            &unallocated,
+            50000,
+            &BigInt::from(250_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            0,
+            &hold,
+        );
+        assert!(
+            picked.is_empty(),
+            "recently-confirmed allocation must be held (anti-churn dwell)"
+        );
+    }
+
+    #[test]
+    fn plan_leaves_stays_when_competitive() {
+        let allocated = vec![make_shard(vec![0xAA], 100_000, 0, 1)];
+        let unallocated = vec![make_shard(vec![0xBB], 100_000, 0, 1)];
+        let filters = plan_leaves(
+            &allocated,
+            &unallocated,
+            50000,
+            &BigInt::from(200_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
+        );
+        assert!(filters.is_empty(), "should not leave a competitive shard");
+    }
+
+    #[test]
+    fn plan_leaves_caps_at_3() {
+        let allocated = vec![
+            make_shard(vec![0xA1], 50_000, 4, 1),
+            make_shard(vec![0xA2], 50_000, 4, 1),
+            make_shard(vec![0xA3], 50_000, 4, 1),
+            make_shard(vec![0xA4], 50_000, 4, 1),
+            make_shard(vec![0xA5], 50_000, 4, 1),
+        ];
+        let unallocated = vec![
+            make_shard(vec![0xB1], 200_000, 0, 1),
+            make_shard(vec![0xB2], 200_000, 0, 1),
+            make_shard(vec![0xB3], 200_000, 0, 1),
+            make_shard(vec![0xB4], 200_000, 0, 1),
+        ];
+        let filters = plan_leaves(
+            &allocated,
+            &unallocated,
+            50000,
+            &BigInt::from(450_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
+        );
+        assert_eq!(filters.len(), 3, "should cap at 3 leave proposals");
+    }
+
+    #[test]
+    fn plan_leaves_replaces_only_the_worst_holding_for_one_candidate() {
+        let allocated = vec![
+            make_shard(vec![0xA1], 50_000, 2, 1),
+            make_shard(vec![0xA2], 50_000, 4, 1),
+        ];
+        let unallocated = vec![make_shard(vec![0xBB], 200_000, 0, 1)];
+        let filters = plan_leaves(
+            &allocated,
+            &unallocated,
+            50000,
+            &BigInt::from(300_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
+        );
+        assert_eq!(
+            filters.len(),
+            1,
+            "one candidate may replace only one holding"
+        );
+        assert_eq!(
+            filters[0],
+            vec![0xA2],
+            "worst shard (ring 4) should be first"
+        );
+    }
+
+    /// Halt-risk allocated shard MUST NOT be picked as a leave
+    /// candidate even when its score sits below the 67% threshold —
+    /// mirrors `decide_joins`' confirm-side bypass to keep the
+    /// lifecycle coherent across propose/confirm/leave/decide_leave.
+    #[test]
+    fn plan_leaves_skips_halt_risk() {
+        let allocated = vec![ShardDescriptor {
+            filter: vec![0xAA],
+            size: 5_000,
+            ring: 3,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 2, // ← halt-risk
+            active_count: 2,
+            activating_count: 0,
+        }];
+        let unallocated = vec![make_shard(vec![0xBB], 500_000, 0, 1)];
+        let filters = plan_leaves(
+            &allocated,
+            &unallocated,
+            50000,
+            &BigInt::from(600_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
+        );
+        assert!(
+            filters.is_empty(),
+            "halt-risk allocated shard must not be a leave candidate; got {filters:?}"
+        );
+    }
+
+    /// Leaving a shard with `active_count == HALT_RISK_PROVER_COUNT
+    /// + 1` would drop its Active count to `HALT_RISK_PROVER_COUNT`
+    /// = halt-risk. The protection extends one prover above the
+    /// threshold to forbid that transition.
+    #[test]
+    fn plan_leaves_skips_shard_one_above_halt_risk_threshold() {
+        let allocated = vec![ShardDescriptor {
+            filter: vec![0xAA],
+            size: 5_000,
+            ring: 3,
+            shards: 1,
+            active_on_ring: 1,
+            // Exactly HALT_RISK_PROVER_COUNT + 1 = 4. Leaving makes
+            // it halt-risk.
+            total_active_joining: HALT_RISK_PROVER_COUNT + 1,
+            active_count: HALT_RISK_PROVER_COUNT + 1,
+            activating_count: 0,
+        }];
+        let unallocated = vec![make_shard(vec![0xBB], 500_000, 0, 1)];
+        let filters = plan_leaves(
+            &allocated,
+            &unallocated,
+            50_000,
+            &BigInt::from(600_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
+        );
+        assert!(
+            filters.is_empty(),
+            "shard at threshold+1 must be protected — leaving would push it into halt-risk"
+        );
+    }
+
+    /// Halt-risk swap: with halt-risk shards waiting in the unallocated
+    /// pool AND no free workers to cover them, the node sheds one healthy
+    /// allocation per halt-risk-deficit shard. `free_workers=0`,
+    /// `halt_risk_count=1` → deficit 1 → exactly one swap pick (worst-
+    /// scoring healthy). NOTE: the caller must only run leave proposals
+    /// when coverage data is current (not in prover-only mode); this test
+    /// exercises the pure pick logic.
+    #[test]
+    fn plan_leaves_swap_fires_when_halt_risk_demand_exceeds_free_workers() {
+        let allocated = vec![
+            make_shard(vec![0xA1], 100_000, 0, 1),
+            make_shard(vec![0xA2], 100_000, 0, 1),
+        ];
+        let unallocated = vec![ShardDescriptor {
+            filter: vec![0xBB],
+            size: 90_000,
+            ring: 0,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 2,
+            active_count: 2,
+            activating_count: 0,
+        }];
+        let filters = plan_leaves(
+            &allocated,
+            &unallocated,
+            50_000,
+            &BigInt::from(300_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
+        );
+        assert_eq!(
+            filters.len(),
+            1,
+            "deficit = halt_risk(1) - free_workers(0) = 1 → exactly one swap pick; \
+             got {filters:?}"
+        );
+    }
+
+    /// The swap sheds only allocations whose shard would release this node:
+    /// with the worst-scoring one ruled out, it sheds the next instead. The
+    /// members a shard releases are the ones `chosen_to_depart` confirms when
+    /// every one of them proposes.
+    #[test]
+    fn the_swap_sheds_only_allocations_its_shard_would_release() {
+        let allocated = vec![
+            make_shard(vec![0xA1], 90_000, 0, 1),
+            make_shard(vec![0xA2], 100_000, 0, 1),
+        ];
+        let unallocated = vec![ShardDescriptor {
+            filter: vec![0xBB],
+            size: 90_000,
+            ring: 0,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 2,
+            active_count: 2,
+            activating_count: 0,
+        }];
+        let plan = |releasable: &dyn Fn(&[u8]) -> bool| {
+            plan_leaves_releasing(
+                &allocated,
+                &unallocated,
+                50_000,
+                &BigInt::from(300_000),
+                DEFAULT_UNITS,
+                Strategy::RewardGreedy,
+                0,
+                &std::collections::HashSet::<Vec<u8>>::new(),
+                releasable,
+            )
+            .filters
+        };
+        assert_eq!(
+            plan(&|_| true),
+            vec![vec![0xA1]],
+            "the worst-scoring healthy allocation"
+        );
+        assert_eq!(
+            plan(&|filter| filter != [0xA1]),
+            vec![vec![0xA2]],
+            "the next one this node may leave"
+        );
+        assert!(plan(&|_| false).is_empty(), "no shard would release it");
+
+        let filter = vec![0x42];
+        let members: Vec<Vec<u8>> = (1..=6u8).map(|n| vec![n; 32]).collect();
+        let released: Vec<&Vec<u8>> = members
+            .iter()
+            .filter(|m| releasable_member(m, &filter, &members))
+            .collect();
+        assert_eq!(
+            released.len(),
+            members.len() - (HALT_RISK_PROVER_COUNT as usize + 1)
+        );
+        for leaver in &released {
+            let leaving: Vec<Vec<u8>> = released.iter().map(|m| (*m).clone()).collect();
+            let active = members.len() - leaving.len();
+            assert!(
+                chosen_to_depart(leaver, &filter, active, &leaving),
+                "confirmed at the window"
+            );
+        }
+    }
+
+    /// Halt-risk swap stays quiet when free workers already cover
+    /// the demand: the next plan_and_allocate will fill those
+    /// free slots with halt-risk shards via the join-side priority
+    /// bucket, so there's no reason to shed healthy allocations.
+    #[test]
+    fn plan_leaves_swap_does_not_fire_when_free_workers_cover_demand() {
+        let allocated = vec![
+            make_shard(vec![0xA1], 100_000, 0, 1),
+            make_shard(vec![0xA2], 100_000, 0, 1),
+        ];
+        let unallocated = vec![ShardDescriptor {
+            filter: vec![0xBB],
+            size: 90_000,
+            ring: 0,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: 2,
+            active_count: 2,
+            activating_count: 0,
+        }];
+        // 1 free worker covers the 1 waiting halt-risk shard.
+        let filters = plan_leaves(
+            &allocated,
+            &unallocated,
+            50_000,
+            &BigInt::from(300_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            1,
+            &std::collections::HashSet::<Vec<u8>>::new(),
+        );
+        assert!(
+            filters.is_empty(),
+            "free_workers(1) >= halt_risk(1) → no swap should fire, threshold \
+             alone gates; allocs at 100_000 are above the 67% threshold and stay"
+        );
+    }
+
+    /// Held halt-risk allocations are protected even when the swap
+    /// would otherwise pick them. The shield applies on top of the
+    /// swap path; halt-risk holdings are never shed regardless of
+    /// score or deficit.
+    #[test]
+    fn plan_leaves_shield_protects_held_halt_risk_below_threshold() {
+        let allocated = vec![
+            // Held halt-risk with tiny size → low score (would
+            // normally be leave-eligible by score), but the shield
+            // protects it.
+            ShardDescriptor {
+                filter: vec![0xA1],
+                size: 5_000,
+                ring: 3,
+                shards: 1,
+                active_on_ring: 1,
+                total_active_joining: 2,
+                active_count: 2,
+                activating_count: 0,
+            },
+            // Non-halt-risk, low-scoring active — leave candidate.
+            make_shard(vec![0xA2], 30_000, 4, 1),
+        ];
+        // High-scoring unallocated → threshold is ~0.67 * its score,
+        // well above A2's score → A2 gets picked, A1 spared by shield.
+        let unallocated = vec![make_shard(vec![0xBB], 500_000, 0, 1)];
+        let filters = plan_leaves(
+            &allocated,
+            &unallocated,
+            50_000,
+            &BigInt::from(600_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
+        );
+        assert_eq!(
+            filters,
+            vec![vec![0xA2]],
+            "shield must spare held halt-risk A1 even though its low score \
+             would otherwise make it leave-eligible"
+        );
+    }
+
+    /// plan_leaves DOES leave a non-halt-risk shard even when a
+    /// halt-risk allocated is present — bypass is per-shard, not
+    /// blanket-disabling.
+    #[test]
+    fn plan_leaves_leaves_non_halt_risk_when_halt_risk_present() {
+        let allocated = vec![
+            ShardDescriptor {
+                filter: vec![0xAA],
+                size: 5_000,
+                ring: 3,
+                shards: 1,
+                active_on_ring: 1,
+                total_active_joining: 2, // halt-risk: protected
+                active_count: 2,
+                activating_count: 0,
+            },
+            make_shard(vec![0xBB], 30_000, 4, 1), // non-halt-risk, low score
+        ];
+        let unallocated = vec![make_shard(vec![0xCC], 500_000, 0, 1)];
+        let filters = plan_leaves(
+            &allocated,
+            &unallocated,
+            50000,
+            &BigInt::from(600_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            0,
+            &std::collections::HashSet::<Vec<u8>>::new(),
+        );
+        assert_eq!(
+            filters,
+            vec![vec![0xBB]],
+            "non-halt-risk poor performer should still be a leave candidate"
+        );
+    }
+
+    #[test]
+    fn decide_leaves_confirm_when_still_bad() {
+        let shards = vec![
+            make_shard(vec![0xAA], 50_000, 3, 1),
+            make_shard(vec![0xBB], 200_000, 0, 1),
+        ];
+        let pending = vec![vec![0xAA]];
+        let (reject, confirm) = decide_leaves(
+            &shards,
+            &pending,
+            50000,
+            &BigInt::from(250_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+        );
+        assert!(reject.is_empty(), "bad shard leave should not be rejected");
+        assert_eq!(confirm.len(), 1);
+        assert_eq!(confirm[0], vec![0xAA]);
+    }
+
+    #[test]
+    fn decide_leaves_reject_when_shard_improved() {
+        let shards = vec![
+            make_shard(vec![0xAA], 100_000, 0, 1),
+            make_shard(vec![0xBB], 100_000, 0, 1),
+        ];
+        let pending = vec![vec![0xAA]];
+        let (reject, confirm) = decide_leaves(
+            &shards,
+            &pending,
+            50000,
+            &BigInt::from(200_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+        );
+        assert_eq!(reject.len(), 1, "improved shard leave should be rejected");
+        assert_eq!(reject[0], vec![0xAA]);
+        assert!(confirm.is_empty());
+    }
+
+    #[test]
+    fn decide_leaves_confirm_when_shard_disappeared() {
+        let shards = vec![make_shard(vec![0xBB], 100_000, 0, 1)];
+        let pending = vec![vec![0xAA]];
+        let (reject, confirm) = decide_leaves(
+            &shards,
+            &pending,
+            50000,
+            &BigInt::from(100_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+        );
+        assert!(reject.is_empty());
+        assert_eq!(confirm.len(), 1);
+        assert_eq!(
+            confirm[0],
+            vec![0xAA],
+            "disappeared shard should be confirmed for leave"
+        );
+    }
+
+    #[test]
+    fn decide_leaves_confirm_all_when_no_shards() {
+        let pending = vec![vec![0xAA], vec![0xBB]];
+        let (reject, confirm) = decide_leaves(
+            &[],
+            &pending,
+            50000,
+            &BigInt::from(100_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+        );
+        assert!(reject.is_empty());
+        assert_eq!(
+            confirm.len(),
+            2,
+            "all leaves should be confirmed when no shards exist"
+        );
+    }
+
+    #[test]
+    fn decide_leaves_mixed_decisions() {
+        let shards = vec![
+            make_shard(vec![0xAA], 150_000, 0, 1),
+            make_shard(vec![0xBB], 50_000, 3, 1),
+            make_shard(vec![0xCC], 200_000, 0, 1),
+        ];
+        let pending = vec![vec![0xAA], vec![0xBB]];
+        let (reject, confirm) = decide_leaves(
+            &shards,
+            &pending,
+            50000,
+            &BigInt::from(400_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+        );
+        let reject_hex: Vec<String> = reject.iter().map(hex::encode).collect();
+        let confirm_hex: Vec<String> = confirm.iter().map(hex::encode).collect();
+        assert!(reject_hex.contains(&"aa".to_string()),
+            "aa should be rejected (shard improved), got reject={reject_hex:?} confirm={confirm_hex:?}");
+        assert!(
+            confirm_hex.contains(&"bb".to_string()),
+            "bb should be confirmed (still bad), got reject={reject_hex:?} confirm={confirm_hex:?}"
+        );
+    }
+
+    /// Pending leave on a halt-risk shard gets REJECTED (stay) even
+    /// when the shard's score sits below the 67% threshold. Handles
+    /// the case where a pending leave was queued before the halt-risk
+    /// bypass was deployed, or where the operator manually triggered
+    /// a leave for a shard the network has since become dependent on.
+    #[test]
+    fn decide_leaves_rejects_halt_risk_pending() {
+        let shards = vec![
+            ShardDescriptor {
+                filter: vec![0xAA],
+                size: 5_000,
+                ring: 3,
+                shards: 1,
+                active_on_ring: 1,
+                total_active_joining: 2, // ← halt-risk
+                active_count: 2,
+                activating_count: 0,
+            },
+            make_shard(vec![0xBB], 500_000, 0, 1),
+        ];
+        let pending = vec![vec![0xAA]];
+        let (reject, confirm) = decide_leaves(
+            &shards,
+            &pending,
+            50000,
+            &BigInt::from(600_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+        );
+        assert_eq!(
+            reject,
+            vec![vec![0xAA]],
+            "halt-risk pending leave must be rejected (stay); got confirm={confirm:?}"
+        );
+        assert!(confirm.is_empty());
+    }
+
+    /// A held shard where a pending leave is decided: our seat is Leaving,
+    /// so `active_count` counts the other provers only.
+    fn held_with_active(active_count: u64) -> ShardDescriptor {
+        ShardDescriptor {
+            filter: vec![0xAA],
+            size: 5_000,
+            ring: 3,
+            shards: 1,
+            active_on_ring: 1,
+            total_active_joining: active_count,
+            active_count,
+            activating_count: 0,
+        }
+    }
+
+    /// The plan proposes a leave off a shard one over its shield (our seat
+    /// Active). At the decision our seat is Leaving and the shard keeps
+    /// `HALT_RISK_PROVER_COUNT + 1` Active provers, which is not halt risk:
+    /// the leave confirms, under both decision rules.
+    #[test]
+    fn a_planned_leave_confirms_when_the_shard_keeps_one_over_halt_risk() {
+        let available = vec![make_shard(vec![0xBB], 500_000, 0, 1)];
+        let planned = plan_score_replacements(
+            &[held_with_active(HALT_RISK_PROVER_COUNT + 2)],
+            &available,
+            50_000,
+            &BigInt::from(600_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+            &std::collections::HashSet::<Vec<u8>>::new(),
+        );
+        assert_eq!(
+            planned.iter().map(|r| &r.leave_filter).collect::<Vec<_>>(),
+            vec![&vec![0xAAu8]],
+            "the plan proposes the leave"
+        );
+        let held = vec![held_with_active(HALT_RISK_PROVER_COUNT + 1)];
+        let pending = vec![vec![0xAA]];
+        let (reject, confirm) = decide_leaves_against_replacements(
+            &held,
+            &available,
+            &pending,
+            50_000,
+            &BigInt::from(600_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+        );
+        assert_eq!(
+            (reject, confirm),
+            (Vec::<Vec<u8>>::new(), pending.clone()),
+            "a shard keeping {} Active provers must release the leave the plan proposed",
+            HALT_RISK_PROVER_COUNT + 1
+        );
+        let mut all = held;
+        all.extend(available);
+        let (reject, confirm) = decide_leaves(
+            &all,
+            &pending,
+            50_000,
+            &BigInt::from(600_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+        );
+        assert_eq!(
+            (reject, confirm),
+            (Vec::<Vec<u8>>::new(), pending),
+            "decide_leaves must release it too"
+        );
+    }
+
+    /// One prover fewer: the shard would keep `HALT_RISK_PROVER_COUNT`
+    /// Active provers, halt risk, so the pending leave is rejected however
+    /// much better the replacement scores.
+    #[test]
+    fn a_pending_leave_into_halt_risk_is_rejected() {
+        let available = vec![make_shard(vec![0xBB], 500_000, 0, 1)];
+        let held = vec![held_with_active(HALT_RISK_PROVER_COUNT)];
+        let pending = vec![vec![0xAA]];
+        let (reject, confirm) = decide_leaves_against_replacements(
+            &held,
+            &available,
+            &pending,
+            50_000,
+            &BigInt::from(600_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+        );
+        assert_eq!(
+            (reject, confirm),
+            (pending.clone(), Vec::<Vec<u8>>::new()),
+            "a shard keeping {HALT_RISK_PROVER_COUNT} Active provers must keep the seat"
+        );
+        let mut all = held;
+        all.extend(available);
+        let (reject, confirm) = decide_leaves(
+            &all,
+            &pending,
+            50_000,
+            &BigInt::from(600_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+        );
+        assert_eq!(
+            (reject, confirm),
+            (pending, Vec::<Vec<u8>>::new()),
+            "decide_leaves must keep it too"
+        );
+    }
+
+    #[test]
+    fn decide_leaves_no_pending() {
+        let (reject, confirm) = decide_leaves(
+            &[],
+            &[],
+            50000,
+            &BigInt::from(100_000),
+            DEFAULT_UNITS,
+            Strategy::RewardGreedy,
+        );
+        assert!(reject.is_empty());
+        assert!(confirm.is_empty());
+    }
+
+    #[test]
+    fn decide_leaves_data_greedy() {
+        let shards = vec![
+            make_shard(vec![0xAA], 10_000, 0, 1),
+            make_shard(vec![0xBB], 80_000, 0, 1),
+        ];
+        let pending = vec![vec![0xAA]];
+        let (reject, confirm) = decide_leaves(
+            &shards,
+            &pending,
+            50000,
+            &BigInt::from(90_000),
+            DEFAULT_UNITS,
+            Strategy::DataGreedy,
+        );
+        assert!(reject.is_empty());
+        assert_eq!(confirm.len(), 1);
+        assert_eq!(
+            confirm[0],
+            vec![0xAA],
+            "small shard should be confirmed for leave in DataGreedy"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reward_arithmetic_tests {
+    use super::*;
+
+    #[test]
+    fn proposer_and_rpc_use_the_same_reward_arithmetic() {
+        for (shards, expected) in [(1, 100), (2, 70), (3, 57), (5, 44), (7, 37)] {
+            let shard = ShardDescriptor {
+                filter: vec![1],
+                size: 100,
+                ring: 0,
+                shards,
+                active_on_ring: 8,
+                total_active_joining: 8,
+                active_count: 8,
+                activating_count: 0,
+            };
+            let scored = score_shards(&[shard], &1600.into(), &100.into(), Strategy::RewardGreedy);
+            assert_eq!(scored[0].score, BigInt::from(expected));
+            assert_eq!(
+                crate::shard_info::compute_shard_reward(
+                    &1600.into(),
+                    &100.into(),
+                    &100.into(),
+                    0,
+                    shards
+                ),
+                BigInt::from(expected)
+            );
+        }
+        let shard = ShardDescriptor {
+            filter: vec![1],
+            size: 1,
+            ring: 0,
+            shards: 2,
+            active_on_ring: 8,
+            total_active_joining: 8,
+            active_count: 8,
+            activating_count: 0,
+        };
+        assert_eq!(
+            score_shards(&[shard], &229.into(), &10.into(), Strategy::RewardGreedy)[0].score,
+            BigInt::from(1)
+        );
+    }
+}

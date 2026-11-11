@@ -1,0 +1,645 @@
+//! Process and structural memory snapshots.
+//!
+//! Diagnoses OOM growth without a heap profiler: every status tick we
+//! sample (a) the OS-reported resident set size for this process, and
+//! (b) the live entry counts of every known cache / map / channel that
+//! could accumulate state. The deltas between consecutive samples
+//! point at which structure is bleeding memory.
+//!
+//! Linux reads `/proc/self/statm`. macOS uses Mach `task_info`. Other
+//! platforms return `None` — the structural counts still log.
+//!
+//! For deeper analysis (per-allocation provenance), build the node
+//! with the `jemalloc-prof` feature and trigger a heap dump via
+//! `SIGUSR1`. See `crates/quil-node/Cargo.toml` for the toggle.
+
+use std::sync::Arc;
+
+/// OS resident-set-size snapshot in bytes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProcessMemory {
+    pub rss_bytes: u64,
+    /// Virtual-size; only populated on Linux.
+    pub vsize_bytes: u64,
+}
+
+/// Collected, structural sizes that could grow without bound. Add
+/// fields as new caches are introduced. Each entry is "log this in
+/// the status tick"; if a field grows linearly between ticks, that's
+/// where to investigate first.
+#[derive(Debug, Default)]
+pub struct StructuralSizes {
+    pub peer_info_cache: usize,
+    pub shard_engines: usize,
+    pub signer_registry: usize,
+    pub archive_peers_seen: usize,
+    pub peer_info_digest_cache: usize,
+    pub prover_registry_addresses: usize,
+    pub prover_registry_filters: usize,
+    /// `(nodes, pending_frames, equivocator_buckets)` from the
+    /// non-archive `GlobalTimeReel`. Zero on archive nodes.
+    pub time_reel_nodes: usize,
+    pub time_reel_pending: usize,
+    pub time_reel_equivocators: usize,
+    /// Sum across all active `AppConsensusEngine` instances of each
+    /// internal cache. Per-shard counts × shard count — diagnostic
+    /// for the "per-shard caches multiplied by shard count" risk.
+    pub app_engine_frame_store: usize,
+    /// Messages and bytes held by the shard mempools.
+    pub app_engine_mempool_messages: usize,
+    pub app_engine_mempool_bytes: usize,
+    /// Submission arrival stamps the shard engines hold for the routing
+    /// fallback.
+    pub app_engine_routing_seen: usize,
+    pub app_engine_proposal_cache: usize,
+    pub app_engine_pending_certified_parents: usize,
+}
+
+/// Read process RSS. Returns `None` on platforms not implemented or
+/// when the OS-specific call fails. Best-effort; never panics.
+pub fn process_memory() -> Option<ProcessMemory> {
+    #[cfg(target_os = "linux")]
+    {
+        // /proc/self/status has `VmRSS:` and `VmSize:` lines in kB —
+        // no page-size lookup needed. Slower than statm but doesn't
+        // require pulling in libc just for `sysconf`.
+        let raw = std::fs::read_to_string("/proc/self/status").ok()?;
+        let mut rss_kb: u64 = 0;
+        let mut vsize_kb: u64 = 0;
+        for line in raw.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                rss_kb = parse_kb(rest).unwrap_or(0);
+            } else if let Some(rest) = line.strip_prefix("VmSize:") {
+                vsize_kb = parse_kb(rest).unwrap_or(0);
+            }
+        }
+        if rss_kb == 0 && vsize_kb == 0 {
+            return None;
+        }
+        return Some(ProcessMemory {
+            rss_bytes: rss_kb * 1024,
+            vsize_bytes: vsize_kb * 1024,
+        });
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Mach task_info(MACH_TASK_BASIC_INFO). RSS only — vsize
+        // requires a separate call we skip.
+        return mach_rss_bytes().map(|rss| ProcessMemory {
+            rss_bytes: rss,
+            vsize_bytes: 0,
+        });
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_kb(line: &str) -> Option<u64> {
+    // " 123456 kB"
+    let trimmed = line.trim();
+    let num: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+    num.parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn mach_rss_bytes() -> Option<u64> {
+    use std::mem::MaybeUninit;
+    // SAFETY: mach_task_self() returns the current task port; we
+    // pass an aligned MaybeUninit struct of the size the kernel
+    // expects (verified via MACH_TASK_BASIC_INFO_COUNT).
+    unsafe {
+        const MACH_TASK_BASIC_INFO: i32 = 20;
+        // mach_task_basic_info layout (libc 0.2 doesn't re-export it):
+        //   virtual_size: u64
+        //   resident_size: u64
+        //   resident_size_max: u64
+        //   user_time: timeval64 (16 bytes)
+        //   system_time: timeval64 (16 bytes)
+        //   policy: i32
+        //   suspend_count: i32
+        // = 64 bytes total → count = 64 / 4 = 16 u32 words.
+        #[repr(C)]
+        struct MachTaskBasicInfo {
+            virtual_size: u64,
+            resident_size: u64,
+            resident_size_max: u64,
+            user_time: [u64; 2],
+            system_time: [u64; 2],
+            policy: i32,
+            suspend_count: i32,
+        }
+        const COUNT: u32 = (std::mem::size_of::<MachTaskBasicInfo>() / 4) as u32;
+
+        extern "C" {
+            fn mach_task_self() -> u32;
+            fn task_info(
+                target_task: u32,
+                flavor: i32,
+                task_info_out: *mut i32,
+                task_info_count: *mut u32,
+            ) -> i32;
+        }
+
+        let mut info = MaybeUninit::<MachTaskBasicInfo>::uninit();
+        let mut count = COUNT;
+        let kr = task_info(
+            mach_task_self(),
+            MACH_TASK_BASIC_INFO,
+            info.as_mut_ptr() as *mut i32,
+            &mut count,
+        );
+        if kr != 0 {
+            return None;
+        }
+        Some(info.assume_init().resident_size)
+    }
+}
+
+/// Host-wide memory from `/proc/meminfo`, in bytes. Covers every process
+/// on the machine, unlike [`ProcessMemory`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostMemory {
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub swap_total_bytes: u64,
+    pub swap_used_bytes: u64,
+}
+
+/// Parse the text of `/proc/meminfo`. Returns `None` unless `MemTotal`
+/// and `MemAvailable` are both present. Absent swap lines count as no
+/// swap; malformed lines are skipped. Never panics.
+pub fn parse_meminfo(text: &str) -> Option<HostMemory> {
+    let (mut total, mut avail, mut swap_total, mut swap_free) = (None, None, 0u64, 0u64);
+    for line in text.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let mut parts = rest.split_whitespace();
+        let Some(Ok(value)) = parts.next().map(str::parse::<u64>) else {
+            continue;
+        };
+        let bytes = match parts.next() {
+            Some("kB") => value.saturating_mul(1024),
+            None => value,
+            Some(_) => continue,
+        };
+        match key {
+            "MemTotal" => total = Some(bytes),
+            "MemAvailable" => avail = Some(bytes),
+            "SwapTotal" => swap_total = bytes,
+            "SwapFree" => swap_free = bytes,
+            _ => {}
+        }
+    }
+    Some(HostMemory {
+        total_bytes: total?,
+        available_bytes: avail?,
+        swap_total_bytes: swap_total,
+        swap_used_bytes: swap_total.saturating_sub(swap_free),
+    })
+}
+
+/// Host memory now, or `None` when `/proc/meminfo` is unreadable
+/// (non-Linux) or lacks the required fields.
+pub fn host_memory() -> Option<HostMemory> {
+    parse_meminfo(&std::fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+/// Minimum interval between repeated low-memory warnings.
+pub const HOST_LOW_MEMORY_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Available host memory below 10% of the total.
+pub fn host_memory_is_low(mem: &HostMemory) -> bool {
+    mem.total_bytes > 0 && mem.available_bytes.saturating_mul(10) < mem.total_bytes
+}
+
+/// What the caller should log after a host memory sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostMemoryAction {
+    None,
+    /// Low and no warning in the last interval: warn; `low_secs` is how
+    /// long it has been low (0 on the first warning).
+    Warn {
+        low_secs: u64,
+    },
+    /// Was low, no longer is: log one recovery line; `low_secs` is the
+    /// episode's total length.
+    Cleared {
+        low_secs: u64,
+    },
+}
+
+/// Rate-limit state for the host low-memory warning.
+#[derive(Debug, Default)]
+pub struct HostMemoryWatch {
+    low_since: Option<std::time::Instant>,
+    last_warn: Option<std::time::Instant>,
+}
+
+impl HostMemoryWatch {
+    pub fn observe(&mut self, mem: &HostMemory, now: std::time::Instant) -> HostMemoryAction {
+        if host_memory_is_low(mem) {
+            let since = *self.low_since.get_or_insert(now);
+            let due = self.last_warn.map_or(true, |t| {
+                now.duration_since(t) >= HOST_LOW_MEMORY_WARN_INTERVAL
+            });
+            if due {
+                self.last_warn = Some(now);
+                return HostMemoryAction::Warn {
+                    low_secs: now.duration_since(since).as_secs(),
+                };
+            }
+            HostMemoryAction::None
+        } else if let Some(since) = self.low_since.take() {
+            self.last_warn = None;
+            HostMemoryAction::Cleared {
+                low_secs: now.duration_since(since).as_secs(),
+            }
+        } else {
+            HostMemoryAction::None
+        }
+    }
+}
+
+/// Pretty-print bytes as MB (rounded to 0.1).
+pub fn fmt_mb(bytes: u64) -> String {
+    format!("{:.1}", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// jemalloc allocator stats (process-global — covers the master, every
+/// worker thread, AND the C++ RocksDB allocations, since jemalloc overrides
+/// `malloc` process-wide). This is the decisive OOM signal:
+///
+/// - `allocated` rising over time → a TRUE live-heap leak (find it with
+/// `MALLOC_CONF=prof:true` + `jeprof`, or the SIGUSR1 dump).
+/// - `allocated` flat but `resident`/`retained` high → allocator
+/// fragmentation / retained pages, NOT a leak (tune, don't chase).
+/// - `resident − allocated` is the overhead jemalloc holds beyond live data.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JemallocStats {
+    /// Bytes of live application data (the true heap working set).
+    pub allocated: u64,
+    /// Bytes in active pages (≥ allocated; includes per-size-class slack).
+    pub active: u64,
+    /// Bytes physically resident (≈ the allocator's contribution to RSS).
+    pub resident: u64,
+    /// Bytes mapped but not yet returned to the OS (fragmentation pool).
+    pub retained: u64,
+    /// Bytes in the address space mapping.
+    pub mapped: u64,
+}
+
+/// Sample jemalloc's live statistics. Advances the stats epoch first (jemalloc
+/// caches stats and only refreshes them on epoch advance). Returns `None` if
+/// the allocator isn't jemalloc (e.g. an MSVC build) or a read fails.
+#[cfg(not(target_env = "msvc"))]
+pub fn jemalloc_stats() -> Option<JemallocStats> {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    // Refresh the cached statistics.
+    epoch::advance().ok()?;
+    Some(JemallocStats {
+        allocated: stats::allocated::read().ok()? as u64,
+        active: stats::active::read().ok()? as u64,
+        resident: stats::resident::read().ok()? as u64,
+        retained: stats::retained::read().ok()? as u64,
+        mapped: stats::mapped::read().ok()? as u64,
+    })
+}
+
+#[cfg(target_env = "msvc")]
+pub fn jemalloc_stats() -> Option<JemallocStats> {
+    None
+}
+
+/// Per-size-class live-byte breakdown from jemalloc — localizes a leak BY
+/// ALLOCATION SIZE without a heap profiler. jemalloc buckets every allocation
+/// into a size class (small "bins" + "large extents"); `curregs`/`curlextents`
+/// is how many are live right now. The class holding the most live bytes is
+/// where the memory is going:
+/// - dominant SMALL class (e.g. 48B, 4KiB) → many tiny objects leaking
+/// (a HashMap/Vec/Box accumulating entries).
+/// - dominant LARGE/huge class (e.g. 1MiB, 16MiB) → a few big buffers
+/// leaking (trees, replicas, messages, decoded frames).
+/// Cross-reference the size against suspect allocations to pin the source.
+#[derive(Debug, Clone, Default)]
+pub struct JemallocBreakdown {
+    /// Live bytes in small (bin) size classes, merged across arenas.
+    pub small_bytes: u64,
+    /// Live bytes in large size classes, merged across arenas.
+    pub large_bytes: u64,
+    /// Top size classes by live bytes: `(size_class_bytes, live_bytes, count)`.
+    pub top: Vec<(u64, u64, u64)>,
+}
+
+#[cfg(not(target_env = "msvc"))]
+pub fn jemalloc_size_classes() -> JemallocBreakdown {
+    use tikv_jemalloc_ctl::{epoch, raw};
+    // jemalloc's "merged across all arenas" stats index (MALLCTL_ARENAS_ALL).
+    const MERGED: usize = 4096;
+    // SAFETY: every `raw::read` names a real mallctl with the matching C type
+    // (`unsigned`→u32 counts, `size_t`→usize sizes/regions). Errors are mapped
+    // to defaults so a missing name never panics. Requires the `stats` feature.
+    unsafe fn rd_usize(name: String) -> usize {
+        raw::read::<usize>(name.as_bytes()).unwrap_or(0)
+    }
+    let mut out = JemallocBreakdown::default();
+    if epoch::advance().is_err() {
+        return out;
+    }
+    unsafe {
+        out.small_bytes = rd_usize(format!("stats.arenas.{MERGED}.small.allocated\0")) as u64;
+        out.large_bytes = rd_usize(format!("stats.arenas.{MERGED}.large.allocated\0")) as u64;
+
+        let mut classes: Vec<(u64, u64, u64)> = Vec::new();
+        // Small bins.
+        if let Ok(nbins) = raw::read::<u32>(b"arenas.nbins\0") {
+            for i in 0..nbins as usize {
+                let size = rd_usize(format!("arenas.bin.{i}.size\0"));
+                let regs = rd_usize(format!("stats.arenas.{MERGED}.bins.{i}.curregs\0"));
+                if size > 0 && regs > 0 {
+                    classes.push((size as u64, (size * regs) as u64, regs as u64));
+                }
+            }
+        }
+        // Large extents.
+        if let Ok(nlextents) = raw::read::<u32>(b"arenas.nlextents\0") {
+            for i in 0..nlextents as usize {
+                let size = rd_usize(format!("arenas.lextent.{i}.size\0"));
+                let cur = rd_usize(format!("stats.arenas.{MERGED}.lextents.{i}.curlextents\0"));
+                if size > 0 && cur > 0 {
+                    classes.push((size as u64, (size * cur) as u64, cur as u64));
+                }
+            }
+        }
+        classes.sort_by(|a, b| b.1.cmp(&a.1));
+        classes.truncate(8);
+        out.top = classes;
+    }
+    out
+}
+
+#[cfg(target_env = "msvc")]
+pub fn jemalloc_size_classes() -> JemallocBreakdown {
+    JemallocBreakdown::default()
+}
+
+/// Trigger a jemalloc heap-profile dump on demand (the SIGUSR1 handler in
+/// `main` calls this). Heap profiling is COMPILED IN (tikv-jemallocator's
+/// `profiling` feature) but only ACTIVE when the process was started with
+/// `MALLOC_CONF=prof:true` (see the `MALLOC_CONF` note atop `main.rs`); if it
+/// wasn't, `prof.dump` returns an error and we surface a hint rather than
+/// silently no-op.
+///
+/// We write a NULL filename to `prof.dump`, so jemalloc names the file
+/// `<prof_prefix>.<pid>.<seq>.heap` and auto-increments `<seq>` on every dump.
+/// That's the point of a signal-driven dump on a remote box: fire it twice as
+/// RSS climbs, then diff the two on any machine that has the binary:
+///   `jeprof --base=<prefix>.<pid>.0.heap ./quil-node <prefix>.<pid>.1.heap`
+/// The base-diff shows exactly which allocation stacks GREW between the two
+/// samples — i.e. the leak — instead of the whole live heap.
+#[cfg(not(target_env = "msvc"))]
+pub fn dump_heap_profile() -> Result<(), String> {
+    use tikv_jemalloc_ctl::raw;
+    // `prof.dump`'s value is a `const char *` filename; a NULL pointer is the
+    // documented sentinel for "use prof_prefix + an auto seq number".
+    // SAFETY: "prof.dump\0" is a real mallctl whose C value type is
+    // `const char *`; we pass a correctly-typed null pointer of that width.
+    unsafe {
+        raw::write(b"prof.dump\0", std::ptr::null::<std::os::raw::c_char>()).map_err(|e| {
+            format!(
+                "prof.dump failed ({e}); start the node with \
+                 MALLOC_CONF=prof:true,prof_prefix:/tmp/jeprof to enable heap profiling"
+            )
+        })
+    }
+}
+
+#[cfg(target_env = "msvc")]
+pub fn dump_heap_profile() -> Result<(), String> {
+    Err("heap profiling is not available on MSVC builds".to_string())
+}
+
+/// Render the breakdown as a compact one-line string for logging, e.g.
+/// `small=120.0MB large=38000.0MB | 2.0MiB=36000.0MB×18000 4.0KiB=80.0MB×20480 …`.
+pub fn fmt_breakdown(b: &JemallocBreakdown) -> String {
+    let mut s = format!(
+        "small={}MB large={}MB |",
+        fmt_mb(b.small_bytes),
+        fmt_mb(b.large_bytes)
+    );
+    for (size, live, count) in &b.top {
+        s.push_str(&format!(
+            " {}={}MB×{}",
+            fmt_size(*size),
+            fmt_mb(*live),
+            count
+        ));
+    }
+    s
+}
+
+/// Human size-class label (e.g. 48, 4.0KiB, 2.0MiB).
+fn fmt_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1}MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1}KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
+#[cfg(all(test, not(target_env = "msvc")))]
+mod jemalloc_breakdown_tests {
+    use super::*;
+
+    /// Confirms the mallctl names + merged-arena index actually resolve at
+    /// runtime (not just compile): after a deliberate large allocation, the
+    /// breakdown must be populated and the ~8 MiB Vec must surface in a large
+    /// size class. If the names were wrong, `top` would be empty / all zero.
+    #[test]
+    fn size_class_breakdown_is_populated_and_reflects_a_big_alloc() {
+        // Hold a large allocation live so it shows up in `curlextents`.
+        let big: Vec<u8> = vec![7u8; 8 * 1024 * 1024];
+        std::hint::black_box(&big);
+        let br = jemalloc_size_classes();
+        assert!(
+            br.small_bytes > 0 || br.large_bytes > 0,
+            "breakdown empty — mallctl names/merged-arena index likely wrong"
+        );
+        assert!(!br.top.is_empty(), "no size classes returned");
+        // Every entry is well-formed: live == size*count (within the class).
+        for (size, live, count) in &br.top {
+            assert!(*size > 0 && *count > 0 && *live >= *size);
+        }
+        // The 8 MiB allocation should register in the large pool.
+        assert!(
+            br.large_bytes >= 8 * 1024 * 1024,
+            "8MiB alloc not in large pool"
+        );
+        drop(big);
+    }
+}
+
+/// Owning accessor bundle for the live components the master node
+/// tracks. Cheap to clone (everything is `Arc`).
+#[derive(Clone)]
+pub struct StructuralSources {
+    pub peer_info_cache:
+        Arc<parking_lot::RwLock<std::collections::HashMap<Vec<u8>, quil_p2p::CanonicalPeerInfo>>>,
+    pub shard_engines: Arc<
+        parking_lot::RwLock<
+            std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
+        >,
+    >,
+    pub signer_registry: Arc<quil_p2p::SignerRegistry>,
+    pub prover_registry: Arc<quil_execution::SharedProverRegistry>,
+    /// `None` on archive nodes (they don't run the time reel).
+    pub time_reel: Option<Arc<quil_engine::time_reel::GlobalTimeReel>>,
+}
+
+impl StructuralSources {
+    /// Snapshot every tracked size in one pass. Each call acquires
+    /// short read locks — safe to call from the status-tick path.
+    pub fn snapshot(
+        &self,
+        archive_peers_seen_len: usize,
+        peer_info_digest_cache_len: usize,
+    ) -> StructuralSizes {
+        let (prover_addresses, prover_filters) = self
+            .prover_registry
+            .read(|r| (r.distinct_provers(), r.distinct_filters()));
+        let (tr_nodes, tr_pending, tr_eq) = self
+            .time_reel
+            .as_ref()
+            .map(|tr| tr.sizes())
+            .unwrap_or((0, 0, 0));
+        // Aggregate per-shard engine sizes. Quick read-lock on the
+        // shard_engines map, then snapshot each handle's atomic
+        // sizes slot.
+        let (fs, mm, mb, rs, pc, pcp) = {
+            let engines = self.shard_engines.read();
+            let mut fs = 0usize;
+            let mut mm = 0usize;
+            let mut mb = 0usize;
+            let mut rs = 0usize;
+            let mut pc = 0usize;
+            let mut pcp = 0usize;
+            for handle in engines.values() {
+                let s = handle.sizes();
+                fs += s.frame_store;
+                mm += s.mempool_messages;
+                mb += s.mempool_bytes;
+                rs += s.routing_seen;
+                pc += s.proposal_cache;
+                pcp += s.pending_certified_parents;
+            }
+            (fs, mm, mb, rs, pc, pcp)
+        };
+        StructuralSizes {
+            peer_info_cache: self.peer_info_cache.read().len(),
+            shard_engines: self.shard_engines.read().len(),
+            signer_registry: self.signer_registry.len(),
+            archive_peers_seen: archive_peers_seen_len,
+            peer_info_digest_cache: peer_info_digest_cache_len,
+            prover_registry_addresses: prover_addresses,
+            prover_registry_filters: prover_filters,
+            time_reel_nodes: tr_nodes,
+            time_reel_pending: tr_pending,
+            time_reel_equivocators: tr_eq,
+            app_engine_frame_store: fs,
+            app_engine_mempool_messages: mm,
+            app_engine_mempool_bytes: mb,
+            app_engine_routing_seen: rs,
+            app_engine_proposal_cache: pc,
+            app_engine_pending_certified_parents: pcp,
+        }
+    }
+}
+
+#[cfg(test)]
+mod host_memory_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn mem(total_gib: u64, avail_gib: u64) -> HostMemory {
+        HostMemory {
+            total_bytes: total_gib * GIB,
+            available_bytes: avail_gib * GIB,
+            swap_total_bytes: 0,
+            swap_used_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn parses_a_normal_meminfo() {
+        let text = "MemTotal:       16384000 kB\nMemFree:          100000 kB\n\
+                    MemAvailable:    8192000 kB\nSwapCached: 0 kB\n\
+                    SwapTotal:       4194304 kB\nSwapFree:        3145728 kB\n";
+        let m = parse_meminfo(text).unwrap();
+        assert_eq!(m.total_bytes, 16384000 * 1024);
+        assert_eq!(m.available_bytes, 8192000 * 1024);
+        assert_eq!(m.swap_total_bytes, 4194304 * 1024);
+        assert_eq!(m.swap_used_bytes, (4194304 - 3145728) * 1024);
+    }
+
+    #[test]
+    fn missing_swap_means_no_swap_and_missing_required_is_none() {
+        let m = parse_meminfo("MemTotal: 100 kB\nMemAvailable: 50 kB\n").unwrap();
+        assert_eq!((m.swap_total_bytes, m.swap_used_bytes), (0, 0));
+        assert_eq!(parse_meminfo("MemTotal: 100 kB\n"), None);
+        assert_eq!(parse_meminfo("MemAvailable: 50 kB\n"), None);
+    }
+
+    #[test]
+    fn garbage_is_skipped_without_panicking() {
+        assert_eq!(parse_meminfo(""), None);
+        assert_eq!(parse_meminfo("\u{0}\u{1}not meminfo\n:::\n"), None);
+        let m = parse_meminfo("MemTotal: abc kB\nMemTotal: 10 kB\nMemAvailable: 5 kB\nSwapFree: 99999999999999999999 kB\nSwapTotal: 1 kB\n").unwrap();
+        assert_eq!((m.total_bytes, m.available_bytes), (10 * 1024, 5 * 1024));
+        // An unparsable SwapFree counts as 0 free; no underflow either way.
+        assert_eq!(m.swap_used_bytes, 1024);
+    }
+
+    #[test]
+    fn threshold_is_ten_percent_of_total() {
+        assert!(host_memory_is_low(&mem(100, 9)));
+        assert!(!host_memory_is_low(&mem(100, 10)));
+        assert!(!host_memory_is_low(&mem(100, 50)));
+        assert!(host_memory_is_low(&mem(100, 0)));
+        assert!(!host_memory_is_low(&mem(0, 0)));
+    }
+
+    #[test]
+    fn warning_is_rate_limited_and_clear_is_reported_once() {
+        let t0 = Instant::now();
+        let mut w = HostMemoryWatch::default();
+        assert_eq!(w.observe(&mem(100, 50), t0), HostMemoryAction::None);
+        assert_eq!(
+            w.observe(&mem(100, 5), t0),
+            HostMemoryAction::Warn { low_secs: 0 }
+        );
+        let t1 = t0 + Duration::from_secs(599);
+        assert_eq!(w.observe(&mem(100, 5), t1), HostMemoryAction::None);
+        let t2 = t0 + Duration::from_secs(600);
+        assert_eq!(
+            w.observe(&mem(100, 4), t2),
+            HostMemoryAction::Warn { low_secs: 600 }
+        );
+        let t3 = t0 + Duration::from_secs(700);
+        assert_eq!(
+            w.observe(&mem(100, 40), t3),
+            HostMemoryAction::Cleared { low_secs: 700 }
+        );
+        assert_eq!(w.observe(&mem(100, 40), t3), HostMemoryAction::None);
+        // A new episode warns at once, with its own start.
+        let t4 = t3 + Duration::from_secs(1);
+        assert_eq!(
+            w.observe(&mem(100, 3), t4),
+            HostMemoryAction::Warn { low_secs: 0 }
+        );
+    }
+}

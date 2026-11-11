@@ -1,0 +1,328 @@
+name: Setup native deps (FLINT, EMP-tool, EMP-OT)
+description: |
+  Installs the system packages, FLINT (static), and EMP-tool/EMP-OT (static)
+  needed to build the Rust workspace. Handles linux (apt) and macOS
+  (Homebrew). FLINT is built from source on both — Homebrew ships only a
+  dynamic libflint, and we want a fully-static link on macOS so the
+  release binary doesn't depend on libflint.dylib at runtime.
+
+  Outputs:
+    flint-dir: install root for FLINT. On macOS this is
+      $GITHUB_WORKSPACE/src/flint (consumed by node/build.sh via FLINT_DIR).
+      On linux it's /usr/local (build.rs picks it up automatically).
+
+outputs:
+  flint-dir:
+    description: FLINT install root (set FLINT_DIR to this value on macOS)
+    value: ${{ steps.flint-paths.outputs.flint-dir }}
+
+  cache-key:
+    description: Native dependency/compiler fingerprint
+    value: ${{ steps.native-abi.outputs.key }}
+
+runs:
+  using: composite
+  steps:
+    # -------------------------------------------------------------
+    # System packages
+    # -------------------------------------------------------------
+    - name: apt install (linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential \
+          cmake \
+          pkg-config \
+          libgmp-dev \
+          libmpfr-dev \
+          libssl-dev \
+          m4 \
+          autoconf \
+          automake \
+          libtool \
+          git \
+          unzip \
+          curl
+
+    # protoc from apt (3.21) is older than the pinned release; install
+    # the official 28.3 binary and its well-known .proto files. A GitHub
+    # release-download outage must not fail every job in setup, so the
+    # verified download is cached, and on a miss Maven Central's copy of
+    # the same release (protoc 28.3 is published there as 4.28.3, signed
+    # by the protobuf release key) is the fallback. Every artifact is
+    # checked against the hash pinned below before it is installed or
+    # cached. Bump the version and every pin together.
+    - name: Resolve protoc (linux)
+      id: protoc
+      if: runner.os == 'Linux'
+      shell: bash
+      env:
+        PROTOC_VERSION: "28.3"
+      run: |
+        case "$RUNNER_ARCH" in
+          X64)
+            PROTOC_ARCH=linux-x86_64
+            # sha384 of protoc-28.3-linux-x86_64.zip (GitHub release)
+            ZIP_SHA384=eb2c6810df71e595c2df60e0bacd6d2e33d4ba001b553376edcf0021e289688ad85aabf48ed728b72776a9128722b27a
+            # sha256 of protoc-4.28.3-linux-x86_64.exe (Maven Central)
+            EXE_SHA256=0e8c86f9b69b2b0fff91d56d8906a846ad89ce56dfeb1b673287b61c959bd633
+            ;;
+          ARM64)
+            PROTOC_ARCH=linux-aarch_64
+            ZIP_SHA384=39b543c02cdfa093640e67652a86b09d89056249de6de120ade77046f78c2965a4f9b1414ef07c4f59d2f21302baaad0
+            EXE_SHA256=fac5818bce92cfd652264514c0663173643752f6ab6dc83a44b268da880a5cec
+            ;;
+          *) echo "unsupported runner arch: $RUNNER_ARCH" >&2; exit 1 ;;
+        esac
+        # sha256 of protobuf-java-4.28.3.jar (Maven Central): the
+        # well-known .proto files for the Maven fallback.
+        JAR_SHA256=ba02977c0fef8b40af9f85fe69af362d8e13f2685b49a9752750b18da726157e
+        PINS="$(printf '%s %s %s' "$ZIP_SHA384" "$EXE_SHA256" "$JAR_SHA256" | sha256sum | cut -c1-16)"
+        {
+          echo "version=$PROTOC_VERSION"
+          echo "arch=$PROTOC_ARCH"
+          echo "zip-sha384=$ZIP_SHA384"
+          echo "exe-sha256=$EXE_SHA256"
+          echo "jar-sha256=$JAR_SHA256"
+          echo "dir=$HOME/.cache/protoc-$PROTOC_VERSION-$PROTOC_ARCH"
+          echo "key=protoc-$PROTOC_VERSION-$PROTOC_ARCH-$PINS"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Cache protoc download (linux)
+      if: runner.os == 'Linux'
+      uses: actions/cache@v5
+      with:
+        path: ${{ steps.protoc.outputs.dir }}
+        key: ${{ steps.protoc.outputs.key }}
+
+    - name: Install protoc (linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      env:
+        PROTOC_VERSION: ${{ steps.protoc.outputs.version }}
+        PROTOC_ARCH: ${{ steps.protoc.outputs.arch }}
+        ZIP_SHA384: ${{ steps.protoc.outputs.zip-sha384 }}
+        EXE_SHA256: ${{ steps.protoc.outputs.exe-sha256 }}
+        JAR_SHA256: ${{ steps.protoc.outputs.jar-sha256 }}
+        PROTOC_DIR: ${{ steps.protoc.outputs.dir }}
+        PROTOC_PREFIX: /usr/local
+        PROTOBUF_RELEASES: https://github.com/protocolbuffers/protobuf/releases/download
+        MAVEN_PROTOBUF: https://repo1.maven.org/maven2/com/google/protobuf
+      run: |
+        set -euo pipefail
+        ZIP="protoc-$PROTOC_VERSION-$PROTOC_ARCH.zip"
+        EXE="protoc-4.$PROTOC_VERSION-$PROTOC_ARCH.exe"
+        JAR="protobuf-java-4.$PROTOC_VERSION.jar"
+        mkdir -p "$PROTOC_DIR"
+        TMP="$(mktemp -d)"
+        trap 'rm -rf "$TMP"' EXIT
+
+        # Succeeds only when the file exists and matches its pin.
+        verified() { # <dir> <file> <algo> <hash>
+          [[ -f "$1/$2" ]] && (cd "$1" && echo "$4  $2" | "$3sum" -c --quiet -)
+        }
+        # Downloads into TMP, keeps the file only if it matches its pin.
+        fetch() { # <url> <file> <algo> <hash>
+          curl -fsSL --retry 3 --retry-all-errors --connect-timeout 20 \
+            --max-time 300 -o "$TMP/$2" "$1" || return 1
+          if ! verified "$TMP" "$2" "$3" "$4"; then
+            echo "::warning::$2 from $1 does not match its pinned $3"
+            return 1
+          fi
+          mv "$TMP/$2" "$PROTOC_DIR/$2"
+        }
+        have_zip() { verified "$PROTOC_DIR" "$ZIP" sha384 "$ZIP_SHA384"; }
+        have_maven() {
+          verified "$PROTOC_DIR" "$EXE" sha256 "$EXE_SHA256" &&
+            verified "$PROTOC_DIR" "$JAR" sha256 "$JAR_SHA256"
+        }
+
+        if have_zip; then
+          echo "protoc $PROTOC_VERSION: cached GitHub release zip"
+        elif have_maven; then
+          echo "protoc $PROTOC_VERSION: cached Maven Central artifacts"
+        elif fetch "$PROTOBUF_RELEASES/v$PROTOC_VERSION/$ZIP" "$ZIP" sha384 "$ZIP_SHA384"; then
+          echo "protoc $PROTOC_VERSION: GitHub release zip"
+        else
+          echo "::warning::protoc $PROTOC_VERSION GitHub release download failed; using Maven Central"
+          fetch "$MAVEN_PROTOBUF/protoc/4.$PROTOC_VERSION/$EXE" "$EXE" sha256 "$EXE_SHA256"
+          fetch "$MAVEN_PROTOBUF/protobuf-java/4.$PROTOC_VERSION/$JAR" "$JAR" sha256 "$JAR_SHA256"
+        fi
+
+        # Install whichever verified source is now in the cache dir.
+        if have_zip; then
+          sudo unzip -o -q "$PROTOC_DIR/$ZIP" -d "$PROTOC_PREFIX" bin/protoc 'include/*'
+          sudo chmod 0755 "$PROTOC_PREFIX/bin/protoc"
+        else
+          sudo install -D -m 0755 "$PROTOC_DIR/$EXE" "$PROTOC_PREFIX/bin/protoc"
+          sudo unzip -o -q "$PROTOC_DIR/$JAR" 'google/protobuf/*.proto' -d "$PROTOC_PREFIX/include"
+        fi
+        PROTOC_REPORTED="$("$PROTOC_PREFIX/bin/protoc" --version)"
+        echo "$PROTOC_REPORTED"
+        if [[ "$PROTOC_REPORTED" != "libprotoc $PROTOC_VERSION" ]]; then
+          echo "::error::installed protoc reports '$PROTOC_REPORTED', expected $PROTOC_VERSION"
+          exit 1
+        fi
+
+    - name: brew install (macos)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        # Missing packages still get installed; existing formulae stay at the
+        # runner image's versions, including keg-only openssl@3.
+        MISSING_FORMULAE=()
+        for formula in gmp mpfr openssl@3 cmake autoconf automake libtool m4 pkg-config protobuf; do
+          if ! brew list --versions "$formula" >/dev/null 2>&1; then
+            MISSING_FORMULAE+=("$formula")
+          fi
+        done
+        if (( ${#MISSING_FORMULAE[@]} )); then
+          brew install "${MISSING_FORMULAE[@]}"
+        fi
+        protoc --version
+
+    # -------------------------------------------------------------
+    # Resolve FLINT install paths per OS
+    # -------------------------------------------------------------
+    - name: Resolve FLINT paths
+      id: flint-paths
+      shell: bash
+      run: |
+        if [[ "$RUNNER_OS" == "macOS" ]]; then
+          echo "flint-dir=$GITHUB_WORKSPACE/src/flint" >> "$GITHUB_OUTPUT"
+          echo "flint-prefix=$GITHUB_WORKSPACE/src/flint" >> "$GITHUB_OUTPUT"
+        else
+          echo "flint-dir=/usr/local" >> "$GITHUB_OUTPUT"
+          echo "flint-prefix=/usr/local" >> "$GITHUB_OUTPUT"
+        fi
+
+    # Restore/install only needs writable parents and our own native files.
+    # Recursively chowning all of /usr/local/lib walks unrelated runner tools.
+    # macOS needs the same preparation for cached EMP installations.
+    - name: Prepare native install directories
+      shell: bash
+      run: |
+        NATIVE_OWNER="$(id -u):$(id -g)"
+        sudo mkdir -p /usr/local/lib/pkgconfig /usr/local/include /usr/local/cmake
+        sudo chown "$NATIVE_OWNER" /usr/local/lib /usr/local/lib/pkgconfig /usr/local/include /usr/local/cmake
+        for native_path in /usr/local/include/flint /usr/local/include/emp-tool /usr/local/include/emp-ot /usr/local/lib/libflint.* /usr/local/lib/libemp-tool.* /usr/local/lib/pkgconfig/flint.pc /usr/local/cmake; do
+          if [[ -e "$native_path" ]]; then
+            sudo chown -R "$NATIVE_OWNER" "$native_path"
+          fi
+        done
+
+    # Bind native artifacts to installed dependencies and the C++ compiler,
+    # as well as the build recipe below, before restoring either library.
+    - name: Fingerprint native dependencies
+      id: native-abi
+      shell: bash
+      run: |
+        if [[ "$RUNNER_OS" == "macOS" ]]; then
+          NATIVE_DEPS="$(brew list --versions gmp mpfr openssl@3)"
+        else
+          NATIVE_DEPS="$(dpkg-query -W -f='${Package}=${Version}\n' libgmp-dev libmpfr-dev libssl-dev)"
+        fi
+        NATIVE_COMPILER="$(c++ --version)"
+        printf '%s\n%s\n' "$NATIVE_DEPS" "$NATIVE_COMPILER"
+        NATIVE_ABI="$(printf '%s\n%s\n' "$NATIVE_DEPS" "$NATIVE_COMPILER" | shasum -a 256 | cut -d ' ' -f 1)"
+        echo "key=$NATIVE_ABI" >> "$GITHUB_OUTPUT"
+
+    # -------------------------------------------------------------
+    # FLINT 3.0 — built from source, cached per OS/arch
+    # -------------------------------------------------------------
+    - name: Cache FLINT install
+      id: cache-flint
+      uses: actions/cache@v5
+      with:
+        path: |
+          ${{ steps.flint-paths.outputs.flint-prefix }}/lib/libflint.*
+          ${{ steps.flint-paths.outputs.flint-prefix }}/include/flint
+          ${{ steps.flint-paths.outputs.flint-prefix }}/lib/pkgconfig/flint.pc
+        key: flint-3.0-${{ runner.os }}-${{ runner.arch }}-${{ steps.native-abi.outputs.key }}-${{ hashFiles('.github/actions/setup-native-deps/action.yml') }}
+
+    - name: Build FLINT 3.0 (linux)
+      if: runner.os == 'Linux' && steps.cache-flint.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        FLINT_TMP="$(mktemp -d)"
+        git clone --depth 1 --branch flint-3.0 https://github.com/flintlib/flint.git "$FLINT_TMP"
+        pushd "$FLINT_TMP"
+        ./bootstrap.sh
+        ./configure \
+          --prefix=/usr/local \
+          --with-gmp=/usr/local \
+          --with-mpfr=/usr/local \
+          --enable-static --disable-shared \
+          CFLAGS="-O3"
+        make -j"$(nproc)"
+        # No sudo: /usr/local/{lib,include} was chowned to the runner
+        # user in "Make /usr/local install dirs writable" above so the
+        # resulting files are runner-owned and a later cache restore
+        # can write them back without permission errors.
+        make install
+        popd
+        rm -rf "$FLINT_TMP"
+
+    - name: Build FLINT 3.0 (macos)
+      if: runner.os == 'macOS' && steps.cache-flint.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        FLINT_PREFIX="${{ steps.flint-paths.outputs.flint-prefix }}"
+        mkdir -p "$(dirname "$FLINT_PREFIX")"
+        FLINT_TMP="$(mktemp -d)"
+        git clone --depth 1 --branch flint-3.0 https://github.com/flintlib/flint.git "$FLINT_TMP"
+        pushd "$FLINT_TMP"
+        ./bootstrap.sh
+        ./configure \
+          --prefix="$FLINT_PREFIX" \
+          --with-gmp="$(brew --prefix gmp)" \
+          --with-mpfr="$(brew --prefix mpfr)" \
+          --enable-static --disable-shared \
+          CFLAGS="-O3"
+        make -j"$(sysctl -n hw.ncpu)"
+        make install
+        popd
+        rm -rf "$FLINT_TMP"
+
+    # -------------------------------------------------------------
+    # EMP-tool + EMP-OT — in-tree sources, cmake build/install,
+    # cached on the source-tree SHA so cache invalidates if those
+    # directories change.
+    # -------------------------------------------------------------
+    - name: Cache EMP-tool / EMP-OT install
+      id: cache-emp
+      uses: actions/cache@v5
+      with:
+        path: |
+          /usr/local/include/emp-tool
+          /usr/local/include/emp-ot
+          /usr/local/lib/libemp-tool.*
+          /usr/local/cmake
+        key: emp-${{ runner.os }}-${{ runner.arch }}-${{ steps.native-abi.outputs.key }}-${{ hashFiles('emp-tool/**', 'emp-ot/**', '.github/actions/setup-native-deps/action.yml') }}
+
+    - name: Build EMP-tool + EMP-OT
+      if: steps.cache-emp.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        # Patch emp-tool's CMakeLists to build a STATIC library — matches
+        # docker/build-emp.sh and ensures the ferret crate links
+        # statically.
+        sed -i.bak 's|add_library(${NAME} SHARED ${sources})|add_library(${NAME} STATIC ${sources})|g' emp-tool/CMakeLists.txt
+        rm -f emp-tool/CMakeLists.txt.bak
+
+        # EMP defaults to the unversioned Homebrew openssl prefix. Pass
+        # the installed formula explicitly, including when building EMP-OT.
+        OPENSSL_CMAKE_ARGS=()
+        if [[ "$RUNNER_OS" == "macOS" ]]; then
+          OPENSSL_CMAKE_ARGS+=("-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)")
+        fi
+
+        cmake -S emp-tool -B emp-tool/build -DCMAKE_INSTALL_PREFIX=/usr/local "${OPENSSL_CMAKE_ARGS[@]}"
+        cmake --build emp-tool/build -j
+        cmake --install emp-tool/build
+
+        cmake -S emp-ot -B emp-ot/build -DCMAKE_INSTALL_PREFIX=/usr/local "${OPENSSL_CMAKE_ARGS[@]}"
+        cmake --build emp-ot/build -j
+        cmake --install emp-ot/build

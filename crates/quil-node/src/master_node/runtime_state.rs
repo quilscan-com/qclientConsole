@@ -1,0 +1,360 @@
+use std::sync::Arc;
+
+use tracing::{debug, error, info};
+
+use quil_lifecycle::Supervisor;
+
+pub(crate) struct RuntimeState {
+    pub message_collector: Arc<quil_engine::message_collector::MessageCollector>,
+    pub prover_registry: Arc<quil_execution::SharedProverRegistry>,
+    pub prover_only_flag: Arc<std::sync::atomic::AtomicBool>,
+    pub global_event_distributor: Arc<dyn quil_types::consensus::EventDistributor>,
+    pub coverage_monitor: Arc<quil_engine::coverage::CoverageMonitor>,
+    pub halt_state: Arc<quil_engine::halt_state::HaltState>,
+    pub remote_worker_manager_for_halt:
+        Arc<std::sync::OnceLock<Arc<quil_engine::remote_worker::RemoteWorkerManager>>>,
+}
+
+/// The node's GLOBAL message collector. Only a node taking part in GLOBAL
+/// consensus collects from it: elsewhere it refuses every message. Its ranks
+/// keep room for shard frame headers and storage epoch proofs, and cap
+/// persistent-sector capacity messages.
+fn global_message_collector(
+    consensus_participant: bool,
+) -> Arc<quil_engine::message_collector::MessageCollector> {
+    let collector = Arc::new(quil_engine::message_collector::MessageCollector::new());
+    collector.set_class_shares();
+    if !consensus_participant {
+        collector.set_no_proposer();
+    }
+    collector
+}
+
+pub(crate) fn init(
+    sup: &mut Supervisor<anyhow::Error>,
+    consensus_participant: bool,
+    hg_store: Arc<quil_store::RocksHypergraphStore>,
+    shard_engines: Arc<
+        parking_lot::RwLock<
+            std::collections::HashMap<Vec<u8>, quil_engine::app_engine::AppEngineHandle>,
+        >,
+    >,
+) -> RuntimeState {
+    // ---------------------------------------------------------------
+    // 5c. Message collector + consensus event loop
+    // ---------------------------------------------------------------
+    let message_collector = global_message_collector(consensus_participant);
+
+    // The consensus event loop is optional — it runs only when this node
+    // has a BLS proving key and is an active prover. For now we create
+    // the prover registry and message collector, but defer the full
+    // HotStuff event loop until the node has synced enough state to
+    // determine its role. The consensus components are ready to be
+    // wired when this node becomes an active prover.
+    let prover_registry = Arc::new(quil_execution::SharedProverRegistry::new());
+    {
+        let pr = prover_registry.clone();
+        let hs = hg_store.clone();
+        // Run in background — don't block P2P startup. The registry
+        // populates asynchronously; consensus won't start until it's ready.
+        // Supervised as a startup task: a normal completion is expected
+        // and won't shut down the node; a panic or error will.
+        sup.spawn_startup_task("prover-registry-refresh", move |_token| async move {
+            tokio::task::spawn_blocking(move || {
+                pr.refresh_from_store(hs.as_ref())?;
+                let count = pr.read(|r| r.distinct_provers());
+                tracing::info!(provers = count, "prover registry loaded (background)");
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .map_err(anyhow::Error::from)?
+        });
+    }
+
+    // ---------------------------------------------------------------
+    // 5d. Coverage monitor + worker allocator + worker threads
+    // ---------------------------------------------------------------
+    let prover_only_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let global_event_distributor: Arc<dyn quil_types::consensus::EventDistributor> =
+        Arc::new(quil_engine::event_distributor::InMemoryEventDistributor::new());
+    // Coverage thresholds. Mainnet defaults (max_provers=32) never trip the
+    // shard-split rebalance trigger on a small localnet (a handful of provers),
+    // so splits can't be exercised locally. DEV/localnet ONLY: `QUIL_SPLIT_MAX_PROVERS`
+    // lowers the split trigger's `max_provers` so a shard with more Active provers
+    // than the override proposes a split (→ ShardSplitEligible → orchestrator op →
+    // PendingShardChange → epoch-aligned flip at E+2). Env-gated exactly like
+    // `QUIL_EPOCH_LENGTH_FRAMES` — mainnet never sets it, so mainnet is untouched.
+    let coverage_thresholds = {
+        let mut t = quil_engine::coverage::CoverageThresholds::mainnet();
+        if let Some(n) = std::env::var("QUIL_SPLIT_MAX_PROVERS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            tracing::warn!(
+                max_provers = n,
+                "QUIL_SPLIT_MAX_PROVERS override active (dev/localnet only) — shards with more \
+                 than this many Active provers will propose a split"
+            );
+            t.max_provers = n;
+        }
+        // DEV/localnet ONLY: `QUIL_MIN_PROVERS` lowers the MERGE trigger's
+        // `min_provers`. A merge fires when BOTH halves of a pair look starved
+        // (`active_count < min_provers`), and the mainnet default of 6 is above
+        // anything a localnet fields — so a freshly split shard is merged straight
+        // back, and worse, a restart makes every shard look starved for a couple of
+        // epochs while allocations re-activate. Setting this to 0 makes the trigger
+        // unreachable (`active_count >= 0` always), which is what lets a localnet
+        // HOLD a split topology long enough to test anything on it. Env-gated
+        // exactly like `QUIL_SPLIT_MAX_PROVERS` — mainnet never sets it.
+        if let Some(n) = std::env::var("QUIL_MIN_PROVERS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            tracing::warn!(
+                min_provers = n,
+                "QUIL_MIN_PROVERS override active (dev/localnet only) — shard pairs with \
+                 fewer than this many Active provers each will propose a merge"
+            );
+            t.min_provers = n;
+        }
+        t
+    };
+    let coverage_monitor = Arc::new(quil_engine::coverage::CoverageMonitor::new(
+        prover_registry.clone() as Arc<dyn quil_types::consensus::ProverRegistry>,
+        global_event_distributor.clone(),
+        coverage_thresholds,
+        prover_only_flag.clone(),
+    ));
+
+    // Shared halt state — written by the coverage-event subscriber
+    // below, read by the lifecycle `join_proposal_ready` gate and by
+    // the periodic eviction scheduler. Needs to exist before any
+    // consumer references it.
+    let halt_state = Arc::new(quil_engine::halt_state::HaltState::new());
+
+    // Spawn subscriber: drains ControlEvents from the in-memory
+    // distributor and updates `halt_state` on CoverageHalt /
+    // CoverageResume. The separate shard orchestration subscriber is
+    // wired below once the prover pipeline exists.
+    {
+        let mut rx = global_event_distributor.subscribe("halt-state");
+        let hs = halt_state.clone();
+        sup.run_until_cancelled("halt-state-subscriber", move |_token| async move {
+            loop {
+                let Some(event) = rx.recv().await else { break };
+                match (event.event_type, &event.data) {
+                    (
+                        quil_types::consensus::ControlEventType::CoverageHalt,
+                        quil_types::consensus::ControlEventData::Coverage { filter, duration },
+                    ) => {
+                        if hs.apply(&event) {
+                            info!(
+                                filter = hex::encode(filter),
+                                duration_frames = *duration,
+                                halted_count = hs.halted_count(),
+                                "coverage halt entered"
+                            );
+                            quil_engine::metrics::inc_coverage_halts_entered();
+                            quil_engine::metrics::set_halted_shards(hs.halted_count() as u64);
+                        }
+                    }
+                    (
+                        quil_types::consensus::ControlEventType::Halt,
+                        quil_types::consensus::ControlEventData::Alert { message },
+                    ) => {
+                        // Hard halt — ALL shards stop. This is a fire
+                        // alarm, not a per-shard coverage issue.
+                        // Permanent for this process lifetime; operator
+                        // must restart after the alert is resolved.
+                        error!(
+                            message = %message,
+                            "GLOBAL ALERT — hard halt, stopping all shard engines"
+                        );
+                        hs.hard_halt();
+                    }
+                    (
+                        quil_types::consensus::ControlEventType::CoverageResume,
+                        quil_types::consensus::ControlEventData::Coverage { filter, .. },
+                    ) => {
+                        if hs.apply(&event) {
+                            info!(
+                                filter = hex::encode(filter),
+                                halted_count = hs.halted_count(),
+                                "coverage halt resumed"
+                            );
+                            quil_engine::metrics::inc_coverage_resumes();
+                            quil_engine::metrics::set_halted_shards(hs.halted_count() as u64);
+                        }
+                    }
+                    (
+                        quil_types::consensus::ControlEventType::ShardSplitEligible,
+                        quil_types::consensus::ControlEventData::ShardSplit { filter, proposed },
+                    ) => {
+                        info!(
+                            filter = hex::encode(filter),
+                            proposed = proposed.len(),
+                            "shard split eligible (orchestration pending)"
+                        );
+                    }
+                    (
+                        quil_types::consensus::ControlEventType::ShardMergeEligible,
+                        quil_types::consensus::ControlEventData::ShardMerge { filters, parent },
+                    ) => {
+                        info!(
+                            filter_count = filters.len(),
+                            parent = hex::encode(parent),
+                            "shard merge eligible (orchestration pending)"
+                        );
+                    }
+                    (quil_types::consensus::ControlEventType::CoverageWarn, _) => {
+                        debug!("coverage warn");
+                        quil_engine::metrics::inc_coverage_warns();
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        });
+    }
+
+    // Broadcast halt-state changes to every active app shard engine
+    // AND every standalone worker process. In-process thread-mode
+    // engines receive via the `shard_engines` map; standalone workers
+    // receive via the `SetHalted` DataIPC RPC, looked up through
+    // `remote_worker_manager_for_halt` (populated later by the
+    // cluster-mode branch of the worker_manager setup).
+    //
+    // Two firings:
+    //   1. Edge-triggered: when `halt_state.watch_any_halted()` flips,
+    //      push the new value immediately.
+    //   2. Periodic resync (every 30s) while a halt is active: covers
+    //      worker reconnects and the initial-connect race where a
+    //      worker boots mid-halt and would otherwise stay halted=false
+    //      until the next edge transition.
+    let remote_worker_manager_for_halt: Arc<
+        std::sync::OnceLock<Arc<quil_engine::remote_worker::RemoteWorkerManager>>,
+    > = Arc::new(std::sync::OnceLock::new());
+    {
+        let mut rx = halt_state.watch_any_halted();
+        let engines = shard_engines.clone();
+        let remote_mgr_cell = remote_worker_manager_for_halt.clone();
+        let halt_state_for_periodic = halt_state.clone();
+        sup.run_until_cancelled("halt-state-broadcaster", move |_token| async move {
+            let mut periodic = tokio::time::interval(std::time::Duration::from_secs(30));
+            periodic.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    res = rx.changed() => {
+                        if res.is_err() { break; }
+                        let halted = *rx.borrow();
+                        // Scope the read guard: parking_lot::RwLockReadGuard
+                        // is !Send, so it must drop before any .await.
+                        let count = {
+                            let map = engines.read();
+                            let n = map.len();
+                            for (_filter, handle) in map.iter() {
+                                handle.set_halted(halted);
+                            }
+                            n
+                        };
+                        if let Some(mgr) = remote_mgr_cell.get() {
+                            mgr.broadcast_set_halted(halted).await;
+                        }
+                        info!(
+                            halted,
+                            engines = count,
+                            "broadcast halt state to app shard engines"
+                        );
+                    }
+                    _ = periodic.tick() => {
+                        let halted = halt_state_for_periodic.any_halted();
+                        if !halted {
+                            continue;
+                        }
+                        // Re-push to every engine + remote worker so a
+                        // freshly-connected worker picks up the halt.
+                        {
+                            let map = engines.read();
+                            for (_filter, handle) in map.iter() {
+                                handle.set_halted(true);
+                            }
+                        }
+                        if let Some(mgr) = remote_mgr_cell.get() {
+                            mgr.broadcast_set_halted(true).await;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        });
+    }
+
+    // Wire prover-only mode into the message collector
+    // (the collector checks this flag on each add_message call)
+    let mc_prover_only = message_collector.clone();
+    let pof = prover_only_flag.clone();
+    sup.run_until_cancelled("prover-only-mode-poll", move |_token| async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            mc_prover_only.set_prover_only_mode(pof.load(std::sync::atomic::Ordering::Relaxed));
+        }
+    });
+
+    RuntimeState {
+        message_collector,
+        prover_registry,
+        prover_only_flag,
+        global_event_distributor,
+        coverage_monitor,
+        halt_state,
+        remote_worker_manager_for_halt,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quil_engine::message_collector::{Refusal, SubmitOutcome};
+
+    /// A regular node's collector told submitters "accepted", held what they
+    /// sent for good, and at its cap stayed full until a restart.
+    #[test]
+    fn only_a_consensus_participants_collector_holds_messages() {
+        let regular = global_message_collector(false);
+        assert_eq!(
+            regular.add_message_outcome(1, b"prover-op".to_vec()),
+            SubmitOutcome::Filtered(Refusal::NoProposer),
+            "a regular node accepted a message no frame of its would carry"
+        );
+        assert_eq!(regular.pending_totals(), (0, 0));
+
+        let participant = global_message_collector(true);
+        assert_eq!(
+            participant.add_message_outcome(1, b"prover-op".to_vec()),
+            SubmitOutcome::Accepted
+        );
+        assert_eq!(participant.pending_count(1), 1);
+    }
+
+    /// The GLOBAL collector keeps class shares: shard frame headers and
+    /// storage epoch proofs keep room in each rank, which capacity messages
+    /// filled on 2026-11-08.
+    #[test]
+    fn the_global_collector_keeps_class_shares() {
+        for participant in [true, false] {
+            assert!(
+                global_message_collector(participant).class_shares(),
+                "class-share global-shares: the GLOBAL collector (participant: {participant}) keeps no room for shard headers and storage epoch proofs"
+            );
+        }
+    }
+
+    #[test]
+    fn archives_and_localnet_regulars_take_part_in_global_consensus() {
+        assert!(super::super::global_consensus_participant(true, 0));
+        assert!(super::super::global_consensus_participant(false, 99));
+        assert!(!super::super::global_consensus_participant(false, 0));
+        assert!(!super::super::global_consensus_participant(false, 1));
+    }
+}

@@ -1,0 +1,49 @@
+# 2.1.0.18
+- resolve transaction missing from certain tree methods
+- resolve tree deletion corruption
+- resolve seniority bug
+- added DKLs23 fork
+- fixed channel bug
+- added raw bytestream to ferret
+- added challenge derivation for ed448 in FROST
+- fixed race condition in global intrinsic
+- other smaller bug fixes
+
+# 2.1.0.17
+- resolve sync race condition with prover registry pruning
+- update hypergraph to directly manage raw deletions
+- migration to resolve records issue from above
+- resolve early snapshot termination issue
+- global halts are now just halts on processing non-global ops
+ 
+# 2.1.0.16
+- build_utils – static code analysis checker for underlying slice assignment
+- hypergraph snapshot manager now uses in memory snapshot instead of pebble snapshot
+- hypersync can delete orphaned entries
+- signature aggregation wrapper for app shards no longer expects proposer to have a proof (the proof is already in the frame)
+- hook events on sync for app shards
+- app shards properly sync global prover info
+- coverage streaks/halt events now trigger on app shards
+- peer info and key registry handlers on app shard level
+- updated to pebble v2
+- pebble v2 upgrade handler
+- archive mode memory bug fix
+- subtle underlying slice mutation bug fix
+
+# 2.1.0.15
+- Adds direct db sync mode for hypersync
+- Removes blackhole detection entirely
+- Enforces reachability check with new approach
+- Resolves start/stop issue
+
+# 2.1.0.14
+- Resolves race condition around QC processing
+- Remove noisy sync logs
+- Skip unnecessary prover check for global prover info
+- Fix issue with 100+ rejections/confirmations
+- Resolve sync panic
+
+# 2.1.0.13
+- Extends ProverConfirm and ProverReject to have multiple filters per message
+- Adds snapshot integration to allow hypersync to occur concurrently with writes
+- Resolved infinitessimal rings divide-by-zero error
