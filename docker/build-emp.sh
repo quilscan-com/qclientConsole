@@ -7,7 +7,7 @@ set -euo pipefail
 # shellcheck disable=SC2016
 sed -i 's/add_library(${NAME} SHARED ${sources})/add_library(${NAME} STATIC ${sources})/g' emp-tool/CMakeLists.txt
 for tool in emp-tool emp-ot; do
-    cmake -S "$tool" -B "$tool/build" -DCMAKE_INSTALL_PREFIX=/usr/local
+    cmake -S "$tool" -B "$tool/build" -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_TESTING=OFF
     cmake --build "$tool/build" --parallel "$(nproc)"
     cmake --install "$tool/build"
 done
