@@ -90,10 +90,20 @@ FROM base AS gmp-builder
 ARG GMP_VERSION=6.3.0
 # sha256 of gmp-6.3.0.tar.xz; set it together with GMP_VERSION.
 ARG GMP_SHA256=a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898
-RUN wget https://gmplib.org/download/gmp/gmp-${GMP_VERSION}.tar.xz && \
-    echo "${GMP_SHA256}  gmp-${GMP_VERSION}.tar.xz" | sha256sum -c - && \
-    tar -xf gmp-${GMP_VERSION}.tar.xz && \
-    cd gmp-${GMP_VERSION} && \
+RUN set -eu; \
+    gmp_archive="gmp-${GMP_VERSION}.tar.xz"; \
+    gmp_downloaded=0; \
+    for gmp_source in https://ftp.gnu.org/gnu/gmp https://gmplib.org/download/gmp; do \
+      if curl -fSL --retry 2 --retry-all-errors --connect-timeout 10 --max-time 90 \
+          -o "$gmp_archive" "$gmp_source/$gmp_archive" \
+          && printf '%s  %s\n' "$GMP_SHA256" "$gmp_archive" | sha256sum -c -; then \
+        gmp_downloaded=1; \
+        break; \
+      fi; \
+    done; \
+    test "$gmp_downloaded" = 1; \
+    tar -xf "$gmp_archive" && \
+    cd "gmp-${GMP_VERSION}" && \
     ./configure \
         --prefix=/usr/local \
         --enable-static \
