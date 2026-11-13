@@ -10,8 +10,9 @@ use std::collections::HashMap;
 use crate::{
     config::ConfigEntry,
     domain::{
-        format_quil_amount, HealthTarget, HypergraphKind, NodeSnapshot, RewardMintPhase,
-        WalletAction, WalletOperationSnapshot, WalletOperationStatus,
+        format_quil_amount, HealthConditionSnapshot, HealthSnapshot, HealthTarget, HypergraphKind,
+        NodeSnapshot, RewardMintPhase, ShardInfoSnapshot, WalletAction, WalletOperationSnapshot,
+        WalletOperationStatus,
     },
     i18n::{
         web::{format_web_text, page_locale, web_text},
@@ -210,55 +211,27 @@ async fn load_page(
         }
         "prover" => {
             let snapshot = core.state();
+            let health = if snapshot.node_snapshot.is_some() {
+                core.health_report(HealthTarget::SelfNode).await.ok()
+            } else {
+                None
+            };
             let result = snapshot
                 .node_snapshot
                 .as_ref()
-                .map(|node| prover_view(locale, node))
+                .map(|node| prover_view(locale, node, health.as_ref()))
                 .ok_or_else(|| {
                     ServiceError::Connect(web_text(locale, "Refresh node status before viewing Prover data").into())
                 });
             PageResponse::result(slug, "Prover", result)
         }
         "shards" => {
-            let result = core.shard_info(true).await.map(|value| {
-                let empty = value.shards.is_empty().then(|| empty_state(web_text(locale, "Shard directory unavailable"), web_text(locale, "Neither the current node nor the official directory returned any shards.")));
-                let mut stats = vec![
-                    stat(web_text(locale, "Total shards"), value.summary.total, "violet"),
-                    stat(web_text(locale, "Allocated"), value.summary.allocated, "green"),
-                    stat(web_text(locale, "Active Provers"), value.summary.active_provers, "blue"),
-                    stat(web_text(locale, "Data shards"), value.summary.data_shards, "amber"),
-                ];
-                if let Some(concentration) = value.summary.seat_concentration.as_ref() {
-                    stats.push(keyed_stat(
-                        "seat_concentration",
-                        "Seat concentration",
-                        format!("{}/{}", concentration.at_risk, concentration.reported),
-                        if concentration.at_risk > 0 { "amber" } else { "green" },
-                    ));
-                }
-                view(
-                    stats,
-                    vec![section(web_text(locale, "Shard directory"), vec![
-                        field("Global Frame", value.frame_number), field("Difficulty", value.difficulty),
-                        field("World State", value.world_state),
-                        field(web_text(locale, "Network Provers"), value.network_provers.map(|count| count.to_string()).unwrap_or_else(|| web_text(locale, "Unknown").into())),
-                        field(web_text(locale, "Directory status"), if value.directory_stale { web_text(locale, "Data may be stale") } else { web_text(locale, "Up to date") }),
-                        field(web_text(locale, "Directory error"), value.directory_error.unwrap_or_else(|| web_text(locale, "None").into())),
-                    ])],
-                    vec![table(web_text(locale, "Complete shard directory"), vec![
-                        column("filter", "Filter"), column("ring", "Ring"), column("active_provers", web_text(locale, "Active Provers")),
-                        column("official", web_text(locale, "Official data")), column("allocated", web_text(locale, "Allocated")),
-                        column("materialized_frame", web_text(locale, "Materialized frame")), column("latest_frame", web_text(locale, "Latest frame")),
-                        column("daily_quil", web_text(locale, "Estimated daily rewards")),
-                    ], value.shards.into_iter().map(|shard| json!({
-                        "filter": shard.filter_hex, "ring": shard.ring, "active_provers": shard.active_provers,
-                        "official": yes_no(locale, shard.official), "allocated": yes_no(locale, shard.is_allocated),
-                        "materialized_frame": shard.materialized_frame, "latest_frame": shard.latest_frame,
-                        "daily_quil": shard.day_daily_quil.map(|amount| format!("{amount} QUIL")),
-                    })).collect())],
-                    empty,
-                )
-            });
+            let (result, health) = tokio::join!(
+                core.shard_info(true),
+                core.health_report(HealthTarget::SelfNode)
+            );
+            let health = health.ok();
+            let result = result.map(|value| shards_view(locale, value, health.as_ref()));
             PageResponse::result(slug, "Shards", result)
         }
         "rewards" => {
@@ -483,27 +456,10 @@ async fn load_page(
             PageResponse::result(slug, "Aliases", result)
         }
         "health" => {
-            let result = core.health_report(HealthTarget::SelfNode).await.map(|value| {
-                let empty = value.workers.is_empty().then(|| empty_state(web_text(locale, "No Worker health data"), web_text(locale, "The node health report contains no Worker details.")));
-                view(
-                    vec![
-                        stat("Global Head", value.global_head_frame, "blue"), stat("Workers", value.workers.len(), "green"),
-                        stat(web_text(locale, "Omitted Workers"), value.omitted_workers, "amber"),
-                    ],
-                    vec![section(web_text(locale, "Health report"), vec![
-                        field("Release", value.release), field("Build Fingerprint", value.build_fingerprint), field(web_text(locale, "Generated at"), value.generated_unix_ms),
-                    ])],
-                    vec![table(web_text(locale, "Worker health"), vec![
-                        column("core_id", "Core"), column("filter", "Filter"), column("allocated", web_text(locale, "Allocated")),
-                        column("phase", web_text(locale, "Phase")), column("blocker", web_text(locale, "Blocker")),
-                        column("materialized_frame", web_text(locale, "Materialized frame")), column("awaited_frame", web_text(locale, "Awaited frame")),
-                    ], value.workers.into_iter().map(|worker| json!({
-                        "core_id": worker.core_id, "filter": worker.filter_hex, "allocated": yes_no(locale, worker.allocated),
-                        "phase": worker.phase, "blocker": worker.blocker,
-                        "materialized_frame": worker.materialized_frame, "awaited_frame": worker.awaited_frame,
-                    })).collect())], empty,
-                )
-            });
+            let result = core
+                .health_report(HealthTarget::SelfNode)
+                .await
+                .map(|snapshot| health_view(locale, snapshot));
             PageResponse::result(slug, "Health", result)
         }
         "logs" => {
@@ -793,7 +749,385 @@ fn node_view(locale: Locale, config: Option<&ConfigEntry>, node: Option<&NodeSna
     )
 }
 
-fn prover_view(locale: Locale, node: &NodeSnapshot) -> Value {
+fn shards_view(locale: Locale, value: ShardInfoSnapshot, health: Option<&HealthSnapshot>) -> Value {
+    let empty = value.shards.is_empty().then(|| {
+        empty_state(
+            web_text(locale, "Shard directory unavailable"),
+            web_text(
+                locale,
+                "Neither the current node nor the official directory returned any shards.",
+            ),
+        )
+    });
+    let mut stats = vec![
+        stat(
+            web_text(locale, "Total shards"),
+            value.summary.total,
+            "violet",
+        ),
+        stat(
+            web_text(locale, "Allocated"),
+            value.summary.allocated,
+            "green",
+        ),
+        stat(
+            web_text(locale, "Active Provers"),
+            value.summary.active_provers,
+            "blue",
+        ),
+        stat(
+            web_text(locale, "Data shards"),
+            value.summary.data_shards,
+            "amber",
+        ),
+    ];
+    if let Some(concentration) = value.summary.seat_concentration.as_ref() {
+        stats.push(keyed_stat(
+            "seat_concentration",
+            "Seat concentration",
+            format!("{}/{}", concentration.at_risk, concentration.reported),
+            if concentration.at_risk > 0 {
+                "amber"
+            } else {
+                "green"
+            },
+        ));
+    }
+    let rows = value
+        .shards
+        .iter()
+        .map(|shard| {
+            let condition = shard_health_condition(health, &shard.filter_hex);
+            json!({
+                "filter": shard.filter_hex,
+                "ring": shard.ring,
+                "active_provers": shard.active_provers,
+                "official": yes_no(locale, shard.official),
+                "allocated": yes_no(locale, shard.is_allocated),
+                "materialized_frame": shard.materialized_frame,
+                "latest_frame": shard.latest_frame,
+                "daily_quil": shard.day_daily_quil.as_ref().map(|amount| format!("{amount} QUIL")),
+                "health_severity": condition.map(|condition| condition.severity.as_str()),
+                "health_notice": condition.map(|condition| condition.notice.as_str()),
+            })
+        })
+        .collect();
+    view(
+        stats,
+        vec![section(
+            web_text(locale, "Shard directory"),
+            vec![
+                field("Global Frame", value.frame_number),
+                field("Difficulty", value.difficulty),
+                field("World State", value.world_state),
+                field(
+                    web_text(locale, "Network Provers"),
+                    value
+                        .network_provers
+                        .map(|count| count.to_string())
+                        .unwrap_or_else(|| web_text(locale, "Unknown").into()),
+                ),
+                field(
+                    web_text(locale, "Directory status"),
+                    if value.directory_stale {
+                        web_text(locale, "Data may be stale")
+                    } else {
+                        web_text(locale, "Up to date")
+                    },
+                ),
+                field(
+                    web_text(locale, "Directory error"),
+                    value
+                        .directory_error
+                        .unwrap_or_else(|| web_text(locale, "None").into()),
+                ),
+            ],
+        )],
+        vec![keyed_table(
+            "shards",
+            web_text(locale, "Complete shard directory"),
+            vec![
+                column("filter", "Filter"),
+                column("ring", "Ring"),
+                column("active_provers", web_text(locale, "Active Provers")),
+                column("official", web_text(locale, "Official data")),
+                column("allocated", web_text(locale, "Allocated")),
+                column("materialized_frame", web_text(locale, "Materialized frame")),
+                column("latest_frame", web_text(locale, "Latest frame")),
+                column("daily_quil", web_text(locale, "Estimated daily rewards")),
+                column("health_severity", "Health severity"),
+                column("health_notice", "Health notice"),
+            ],
+            rows,
+        )],
+        empty,
+    )
+}
+
+fn health_view(locale: Locale, snapshot: HealthSnapshot) -> Value {
+    let reported_workers = snapshot
+        .workers
+        .len()
+        .saturating_add(snapshot.omitted_workers as usize);
+    let worker_coverage = if snapshot.worker_capacity == 0 {
+        format!("{reported_workers}/unknown")
+    } else {
+        format!("{reported_workers}/{}", snapshot.worker_capacity)
+    };
+    let condition_count = |severity: &str| {
+        if snapshot.conditions_reported {
+            json!(snapshot
+                .conditions
+                .iter()
+                .filter(|condition| condition.severity.eq_ignore_ascii_case(severity))
+                .count())
+        } else {
+            json!("unreported")
+        }
+    };
+    let store_status = if snapshot.master_store_write_failed {
+        "write_failed".into()
+    } else {
+        snapshot
+            .store_io
+            .as_ref()
+            .map(|store| store.verdict.clone())
+            .unwrap_or_else(|| "unreported".into())
+    };
+    let store_tone = store_tone(
+        snapshot.master_store_write_failed,
+        snapshot
+            .store_io
+            .as_ref()
+            .map(|store| store.verdict.as_str()),
+    );
+    let draining_workers = snapshot
+        .workers
+        .iter()
+        .filter(|worker| worker.draining)
+        .count();
+    let mut report_fields = vec![
+        keyed_field("release", "Release", &snapshot.release),
+        keyed_field(
+            "build_fingerprint",
+            "Build Fingerprint",
+            &snapshot.build_fingerprint,
+        ),
+        keyed_field(
+            "generated_unix_ms",
+            web_text(locale, "Generated at (ms)"),
+            snapshot.generated_unix_ms,
+        ),
+        keyed_field(
+            "conditions_reported",
+            "Conditions",
+            if snapshot.conditions_reported {
+                "reported"
+            } else {
+                "unreported"
+            },
+        ),
+        keyed_field(
+            "master_store_write_failed",
+            "Master store writes",
+            if snapshot.master_store_write_failed {
+                "write_failed"
+            } else if !snapshot.conditions_reported && snapshot.store_io.is_none() {
+                "unreported"
+            } else {
+                "no_failure"
+            },
+        ),
+        keyed_field(
+            "unobserved_conditions",
+            web_text(locale, "Unobserved conditions"),
+            if snapshot.unobserved_conditions.is_empty() {
+                Value::Null
+            } else {
+                json!(snapshot.unobserved_conditions.join(" · "))
+            },
+        ),
+        keyed_field(
+            "global_head_frame",
+            "Global Head",
+            snapshot.global_head_frame,
+        ),
+    ];
+    if snapshot.worker_capacity == 0 {
+        report_fields.push(keyed_field(
+            "worker_capacity",
+            "Configured Workers",
+            "unknown",
+        ));
+    }
+    let mut sections = vec![keyed_section(
+        "report",
+        web_text(locale, "Health report"),
+        report_fields,
+    )];
+    if let Some(store) = snapshot.store_io.as_ref() {
+        sections.push(keyed_section(
+            "store_io",
+            "Store I/O",
+            vec![
+                keyed_field("store_io_verdict", "Verdict", &store.verdict),
+                keyed_field("store_io_slow_reason", "Slow reason", &store.slow_reason),
+                keyed_field("store_io_slow_secs", "Slow seconds", store.slow_secs),
+                keyed_field(
+                    "store_io_interval_secs",
+                    "Interval seconds",
+                    store.interval_secs,
+                ),
+                keyed_field("store_io_ended_unix_ms", "Ended (ms)", store.ended_unix_ms),
+                keyed_field("store_io_figures", "Figures", &store.figures),
+                keyed_field("canary_reads", "Canary reads", store.canary_reads),
+                keyed_field("canary_p50_us", "Canary p50 (µs)", store.canary_p50_us),
+                keyed_field("canary_p99_us", "Canary p99 (µs)", store.canary_p99_us),
+                keyed_field("canary_max_us", "Canary max (µs)", store.canary_max_us),
+                keyed_field(
+                    "canary_pending_us",
+                    "Canary pending (µs)",
+                    store.canary_pending_us,
+                ),
+                keyed_field("disk_reads", "Disk reads", store.disk_reads),
+                keyed_field("disk_writes", "Disk writes", store.disk_writes),
+                keyed_field(
+                    "disk_read_await_us",
+                    "Disk read await (µs)",
+                    store.disk_read_await_us,
+                ),
+                keyed_field(
+                    "disk_write_await_us",
+                    "Disk write await (µs)",
+                    store.disk_write_await_us,
+                ),
+                keyed_field("disk_busy_pct", "Disk busy (%)", store.disk_busy_pct),
+            ],
+        ));
+    }
+    let conditions = snapshot
+        .conditions
+        .iter()
+        .map(|condition| {
+            json!({
+                "severity": condition.severity,
+                "scope": condition.scope,
+                "kind": condition.kind,
+                "since": condition.since_unix_ms,
+                "affected": condition.affected,
+                "tracked": condition.tracked,
+                "notice": condition.notice,
+                "action": condition.action,
+                "omitted": condition.omitted_shards,
+            })
+        })
+        .collect();
+    let workers = snapshot
+        .workers
+        .iter()
+        .map(|worker| {
+            let condition =
+                worker_health_condition(Some(&snapshot), &worker.filter_hex, worker.core_id);
+            json!({
+                "core_id": worker.core_id,
+                "filter": worker.filter_hex,
+                "allocated": worker.allocated,
+                "draining": worker.draining,
+                "phase": worker.phase,
+                "blocker": worker.blocker,
+                "materialized_frame": worker.materialized_frame,
+                "awaited_frame": worker.awaited_frame,
+                "health_severity": condition.map(|condition| condition.severity.as_str()),
+                "health_notice": condition.map(|condition| condition.notice.as_str()),
+            })
+        })
+        .collect();
+    view(
+        vec![
+            keyed_stat(
+                "error_conditions",
+                "ERROR",
+                condition_count("error"),
+                "error",
+            ),
+            keyed_stat(
+                "warning_conditions",
+                "WARN",
+                condition_count("warning"),
+                "warning",
+            ),
+            keyed_stat("info_conditions", "INFO", condition_count("info"), "blue"),
+            keyed_stat(
+                "worker_coverage",
+                "Reported/configured Workers",
+                worker_coverage,
+                "violet",
+            ),
+            keyed_stat(
+                "draining_workers",
+                "Draining Workers",
+                draining_workers,
+                if draining_workers > 0 {
+                    "warning"
+                } else {
+                    "green"
+                },
+            ),
+            keyed_stat("store_status", "Store", store_status, store_tone),
+            keyed_stat(
+                "omitted_workers",
+                web_text(locale, "Omitted Workers"),
+                snapshot.omitted_workers,
+                "amber",
+            ),
+        ],
+        sections,
+        vec![
+            keyed_table(
+                "conditions",
+                "Health Conditions",
+                vec![
+                    column("severity", "Severity"),
+                    column("scope", "Scope"),
+                    column("kind", "Kind"),
+                    column("since", "Since (ms)"),
+                    column("affected", "Affected"),
+                    column("tracked", "Tracked"),
+                    column("notice", "Notice"),
+                    column("action", "Action"),
+                    column("omitted", "Omitted"),
+                ],
+                conditions,
+            ),
+            keyed_table(
+                "workers",
+                web_text(locale, "Worker health"),
+                vec![
+                    column("core_id", "Core"),
+                    column("filter", "Filter"),
+                    column("allocated", web_text(locale, "Allocated")),
+                    column("draining", "Draining"),
+                    column("phase", web_text(locale, "Phase")),
+                    column("blocker", web_text(locale, "Blocker")),
+                    column("materialized_frame", web_text(locale, "Materialized frame")),
+                    column("awaited_frame", web_text(locale, "Awaited frame")),
+                    column("health_severity", "Health severity"),
+                    column("health_notice", "Health notice"),
+                ],
+                workers,
+            ),
+        ],
+        snapshot.workers.is_empty().then(|| {
+            keyed_empty_state(
+                "workers",
+                web_text(locale, "No Worker health data"),
+                web_text(locale, "The node health report contains no Worker details."),
+            )
+        }),
+    )
+}
+
+fn prover_view(locale: Locale, node: &NodeSnapshot, health: Option<&HealthSnapshot>) -> Value {
     let idle_workers = node
         .workers
         .iter()
@@ -832,30 +1166,42 @@ fn prover_view(locale: Locale, node: &NodeSnapshot) -> Value {
     }
     let mut tables = Vec::new();
     if !node.allocations.is_empty() {
-        tables.push(table("Allocations", vec![
+        tables.push(keyed_table("allocations", "Allocations", vec![
             column("filter", "Filter"), column("status", web_text(locale, "Status")), column("join_frame", "Join Frame"),
             column("join_confirm_frame", web_text(locale, "Confirmation frame")), column("leave_frame", "Leave Frame"),
             column("last_active_frame", web_text(locale, "Last active frame")), column("epoch", "Epoch"),
-        ], node.allocations.iter().map(|allocation| json!({
-            "filter": allocation.filter_hex, "status": format!("{:?}", allocation.status),
-            "join_frame": allocation.join_frame_number, "join_confirm_frame": allocation.join_confirm_frame_number,
-            "leave_frame": allocation.leave_frame_number, "last_active_frame": allocation.last_active_frame_number, "epoch": allocation.epoch,
-        })).collect()));
+            column("health_severity", "Health severity"), column("health_notice", "Health notice"),
+        ], node.allocations.iter().map(|allocation| {
+            let condition = allocation_health_condition(node, health, &allocation.filter_hex);
+            json!({
+                "filter": allocation.filter_hex, "status": format!("{:?}", allocation.status),
+                "join_frame": allocation.join_frame_number, "join_confirm_frame": allocation.join_confirm_frame_number,
+                "leave_frame": allocation.leave_frame_number, "last_active_frame": allocation.last_active_frame_number, "epoch": allocation.epoch,
+                "health_severity": condition.map(|condition| condition.severity.as_str()),
+                "health_notice": condition.map(|condition| condition.notice.as_str()),
+            })
+        }).collect()));
     }
-    tables.push(table("Workers", vec![
+    tables.push(keyed_table("workers", "Workers", vec![
         column("core_id", "Core"), column("filter", "Filter"), column("available_storage", web_text(locale, "Available storage")),
         column("total_storage", web_text(locale, "Total storage")), column("managed", web_text(locale, "Management")), column("state", web_text(locale, "Execution state")),
         column("blocker", web_text(locale, "Blocker")), column("materialized_frame", web_text(locale, "Materialized frame")),
-    ], node.workers.iter().map(|worker| json!({
-        "core_id": worker.core_id,
-        "filter": if worker.filter_hex.is_empty() { web_text(locale, "Unallocated") } else { worker.filter_hex.as_str() },
-        "available_storage": worker_storage(locale, worker.available_storage, worker.total_storage),
-        "total_storage": worker_storage(locale, worker.total_storage, worker.total_storage),
-        "managed": if worker.manually_managed { web_text(locale, "Manual") } else { web_text(locale, "Automatic") },
-        "state": worker.execution.as_ref().map(|execution| execution.state.as_str()).unwrap_or_else(|| if worker.filter_hex.is_empty() { web_text(locale, "Standby") } else { web_text(locale, "Not reported") }),
-        "blocker": worker.execution.as_ref().and_then(|execution| execution.blocker.clone()),
-        "materialized_frame": worker.execution.as_ref().and_then(|execution| execution.materialized_frame),
-    })).collect()));
+        column("health_severity", "Health severity"), column("health_notice", "Health notice"),
+    ], node.workers.iter().map(|worker| {
+        let condition = worker_health_condition(health, &worker.filter_hex, worker.core_id);
+        json!({
+            "core_id": worker.core_id,
+            "filter": if worker.filter_hex.is_empty() { web_text(locale, "Unallocated") } else { worker.filter_hex.as_str() },
+            "available_storage": worker_storage(locale, worker.available_storage, worker.total_storage),
+            "total_storage": worker_storage(locale, worker.total_storage, worker.total_storage),
+            "managed": if worker.manually_managed { web_text(locale, "Manual") } else { web_text(locale, "Automatic") },
+            "state": worker.execution.as_ref().map(|execution| execution.state.as_str()).unwrap_or_else(|| if worker.filter_hex.is_empty() { web_text(locale, "Standby") } else { web_text(locale, "Not reported") }),
+            "blocker": worker.execution.as_ref().and_then(|execution| execution.blocker.clone()),
+            "materialized_frame": worker.execution.as_ref().and_then(|execution| execution.materialized_frame),
+            "health_severity": condition.map(|condition| condition.severity.as_str()),
+            "health_notice": condition.map(|condition| condition.notice.as_str()),
+        })
+    }).collect()));
     view(
         vec![
             stat(
@@ -875,6 +1221,49 @@ fn prover_view(locale: Locale, node: &NodeSnapshot) -> Value {
         tables,
         empty,
     )
+}
+
+fn allocation_health_condition<'a>(
+    node: &NodeSnapshot,
+    health: Option<&'a HealthSnapshot>,
+    filter_hex: &str,
+) -> Option<&'a HealthConditionSnapshot> {
+    let health = health.filter(|health| health.conditions_reported)?;
+    node.workers
+        .iter()
+        .find(|worker| worker.filter_hex == filter_hex)
+        .map_or_else(
+            || health.highest_condition_for_shard(filter_hex),
+            |worker| health.highest_condition_for_worker(filter_hex, worker.core_id),
+        )
+}
+
+fn worker_health_condition<'a>(
+    health: Option<&'a HealthSnapshot>,
+    filter_hex: &str,
+    core_id: u32,
+) -> Option<&'a HealthConditionSnapshot> {
+    let health = health.filter(|health| health.conditions_reported)?;
+    health.highest_condition_for_worker(filter_hex, core_id)
+}
+
+fn shard_health_condition<'a>(
+    health: Option<&'a HealthSnapshot>,
+    filter_hex: &str,
+) -> Option<&'a HealthConditionSnapshot> {
+    let health = health.filter(|health| health.conditions_reported)?;
+    health.highest_condition_for_shard(filter_hex)
+}
+
+fn store_tone(master_store_write_failed: bool, verdict: Option<&str>) -> &'static str {
+    if master_store_write_failed {
+        return "error";
+    }
+    match verdict.map(str::trim) {
+        Some(verdict) if verdict.eq_ignore_ascii_case("ok") => "green",
+        Some(verdict) if verdict.eq_ignore_ascii_case("slow") => "warning",
+        _ => "neutral",
+    }
 }
 
 fn worker_storage(locale: Locale, value: u64, total: u64) -> Value {
@@ -911,6 +1300,10 @@ fn section(title: impl Into<String>, fields: Vec<Value>) -> Value {
     json!({ "title": title.into(), "fields": fields })
 }
 
+fn keyed_section(key: &'static str, title: impl Into<String>, fields: Vec<Value>) -> Value {
+    json!({ "key": key, "title": title.into(), "fields": fields })
+}
+
 fn field(label: impl Into<String>, value: impl Serialize) -> Value {
     json!({ "label": label.into(), "value": value })
 }
@@ -923,11 +1316,27 @@ fn table(title: impl Into<String>, columns: Vec<Value>, rows: Vec<Value>) -> Val
     json!({ "title": title.into(), "columns": columns, "rows": rows })
 }
 
+fn keyed_table(
+    key: &'static str,
+    title: impl Into<String>,
+    columns: Vec<Value>,
+    rows: Vec<Value>,
+) -> Value {
+    json!({ "key": key, "title": title.into(), "columns": columns, "rows": rows })
+}
+
 fn column(key: &'static str, label: &'static str) -> Value {
     json!({ "key": key, "label": label })
 }
 fn empty_state(title: impl Into<String>, detail: impl Into<String>) -> Value {
     json!({ "title": title.into(), "detail": detail.into() })
+}
+fn keyed_empty_state(
+    key: &'static str,
+    title: impl Into<String>,
+    detail: impl Into<String>,
+) -> Value {
+    json!({ "key": key, "title": title.into(), "detail": detail.into() })
 }
 fn nonempty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
@@ -1087,6 +1496,44 @@ mod tests {
     use crate::domain::{AllocationSnapshot, WorkerExecutionSnapshot, WorkerSnapshot};
 
     #[test]
+    fn health_worker_empty_state_has_a_stable_semantic_key() {
+        let page = health_view(
+            Locale::English,
+            HealthSnapshot {
+                release: "2.1.0.25".into(),
+                build_fingerprint: "abcdef12".into(),
+                global_head_frame: 1,
+                generated_unix_ms: 2,
+                omitted_workers: 0,
+                worker_capacity: 0,
+                master_store_write_failed: false,
+                store_io: None,
+                conditions_reported: false,
+                conditions: Vec::new(),
+                unobserved_conditions: Vec::new(),
+                workers: Vec::new(),
+            },
+        );
+
+        assert_eq!(page["empty_state"]["key"], "workers");
+    }
+
+    #[test]
+    fn store_tone_distinguishes_failures_ok_slow_and_unmeasured_verdicts() {
+        assert_eq!(store_tone(true, Some("ok")), "error");
+        assert_eq!(store_tone(false, Some("ok")), "green");
+        assert_eq!(store_tone(false, Some("slow")), "warning");
+        for verdict in [
+            None,
+            Some("unmeasured"),
+            Some("unspecified"),
+            Some("unknown"),
+        ] {
+            assert_eq!(store_tone(false, verdict), "neutral");
+        }
+    }
+
+    #[test]
     fn idle_workers_are_not_presented_as_running_allocated_provers() {
         let node = NodeSnapshot {
             running_workers: 1,
@@ -1101,7 +1548,7 @@ mod tests {
             ..Default::default()
         };
 
-        let page = prover_view(Locale::English, &node);
+        let page = prover_view(Locale::English, &node, None);
         assert_eq!(page["stats"][0]["label"], "Worker processes");
         assert_eq!(page["stats"][2]["label"], "Standby Workers");
         assert_eq!(page["stats"][2]["value"], 1);
@@ -1139,7 +1586,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let page = prover_view(Locale::English, &executing);
+        let page = prover_view(Locale::English, &executing, None);
         assert_eq!(page["stats"][2]["value"], 0);
         assert!(page["sections"].as_array().unwrap().is_empty());
 
@@ -1156,7 +1603,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let page = prover_view(Locale::English, &allocated);
+        let page = prover_view(Locale::English, &allocated, None);
         assert!(page["sections"].as_array().unwrap().is_empty());
     }
 }

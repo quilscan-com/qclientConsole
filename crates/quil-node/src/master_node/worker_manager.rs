@@ -929,8 +929,11 @@ pub(crate) fn init(
             );
             std::fs::create_dir_all(&path)
                 .map_err(|e| format!("worker {} mkdir {}: {e}", core_id, path.display()))?;
-            let db = quil_store::RocksDb::open(&path)
-                .map_err(|e| format!("worker {} open db {}: {e}", core_id, path.display()))?;
+            let db = quil_store::RocksDb::open_counted(
+                &path,
+                quil_store::write_stats::StoreClass::Workers,
+            )
+            .map_err(|e| format!("worker {} open db {}: {e}", core_id, path.display()))?;
             let db_arc = Arc::new(db);
             db_arc
                 .inner()
@@ -1071,12 +1074,19 @@ pub(crate) fn init(
                         let key = key.clone();
                         Box::pin(async move {
                             let endpoint = pool.next().await?;
-                            let mut client = quil_rpc::ArchiveClient::connect_mtls(&endpoint, &key)
+                            // The connection this process shares with the
+                            // archive, not one per frame.
+                            let mut client = quil_rpc::ArchiveClient::shared(&endpoint, &key)
                                 .await
                                 .ok()?;
                             client
                                 .get_app_shard_frame(filter, frame_number)
                                 .await
+                                .inspect_err(|error| {
+                                    if error.is_connection_failure() {
+                                        client.discard();
+                                    }
+                                })
                                 .ok()
                                 .flatten()
                         })

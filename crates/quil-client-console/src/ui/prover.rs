@@ -11,7 +11,9 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     allocation::{allocation_lifecycle, ActionHint, ActionTiming, AllocationAction},
     app::App,
-    domain::{AllocationSnapshot, AllocationStatus, WorkerSnapshot},
+    domain::{
+        AllocationSnapshot, AllocationStatus, HealthConditionSnapshot, HealthTarget, WorkerSnapshot,
+    },
     i18n::{allocation_action_label, t, Locale},
 };
 
@@ -198,20 +200,33 @@ fn draw_allocation_list(frame: &mut Frame<'_>, app: &App, selected: usize, area:
     let items = allocations.iter().map(|allocation| {
         let calculated = lifecycle(app, allocation);
         let binding = worker_binding(app, allocation);
+        let condition = allocation_health_condition(app, allocation);
+        let health_marker = condition.map_or("", |condition| {
+            super::health::severity_marker(&condition.severity)
+        });
         let suffix = format!(
-            " {} · {}",
+            "{} · {}",
             allocation_label(allocation.status),
             binding.summary(app.locale())
         );
-        let filter_width = width.saturating_sub(suffix.width() + 1).max(4);
+        let marker_width = health_marker.width() + usize::from(!health_marker.is_empty());
+        let filter_width = width
+            .saturating_sub(suffix.width() + marker_width + 1)
+            .max(4);
         ListItem::new(Line::from(vec![
+            Span::styled(
+                (!health_marker.is_empty())
+                    .then(|| format!("{health_marker} "))
+                    .unwrap_or_default(),
+                condition.map_or_else(theme::normal, super::health::condition_style),
+            ),
             Span::styled(
                 compact_middle(&allocation.filter_hex, filter_width),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::raw(truncate_cells(
-                &format!(" {suffix} · {}", calculated.label),
-                width.saturating_sub(filter_width),
+                &format!(" {} · {}", suffix.trim_start(), calculated.label),
+                width.saturating_sub(filter_width + marker_width),
             )),
         ]))
     });
@@ -219,7 +234,7 @@ fn draw_allocation_list(frame: &mut Frame<'_>, app: &App, selected: usize, area:
     frame.render_stateful_widget(
         List::new(items)
             .block(chrome::panel(t(app.locale(), UiText::AllocationList)))
-            .highlight_style(theme::focus().add_modifier(Modifier::BOLD))
+            .highlight_style(Style::default().add_modifier(Modifier::BOLD))
             .highlight_symbol("› "),
         area,
         &mut state,
@@ -299,6 +314,16 @@ fn allocation_detail_lines(app: &App, allocation: &AllocationSnapshot) -> Vec<De
             calculated.label
         ),
     )];
+    if let Some(condition) = allocation_health_condition(app, allocation) {
+        lines.push(DetailField::new(
+            t(locale, UiText::Health),
+            format!(
+                "{} {}",
+                super::health::severity_marker(&condition.severity),
+                condition.notice
+            ),
+        ));
+    }
     lines.extend(core_lines(binding, locale));
     lines.push(DetailField::new(
         t(locale, UiText::Lifecycle),
@@ -583,6 +608,27 @@ fn allocations(app: &App) -> Vec<AllocationSnapshot> {
         }
     }
     allocations
+}
+
+fn allocation_health_condition<'a>(
+    app: &'a App,
+    allocation: &AllocationSnapshot,
+) -> Option<&'a HealthConditionSnapshot> {
+    if app.health.target != HealthTarget::SelfNode {
+        return None;
+    }
+    let health = app.health.snapshot.as_ref()?;
+    if !health.conditions_reported {
+        return None;
+    }
+    match worker_binding(app, allocation) {
+        WorkerBinding::Bound(worker) => {
+            health.highest_condition_for_worker(&allocation.filter_hex, worker.core_id)
+        }
+        WorkerBinding::Unknown | WorkerBinding::Unbound => {
+            health.highest_condition_for_shard(&allocation.filter_hex)
+        }
+    }
 }
 
 #[derive(Clone, Copy)]

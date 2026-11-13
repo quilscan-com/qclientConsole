@@ -15,6 +15,8 @@ pub fn web_text(locale: Locale, english: &'static str) -> &'static str {
     match locale {
         Locale::English => english,
         Locale::TraditionalChinese => match english {
+            "Generated at (ms)" => "產生時間 (ms)",
+            "Unobserved conditions" => "未觀測 Conditions",
             "Current node configuration" => "目前節點設定",
             "Configuration name" => "設定名稱",
             "Configuration directory" => "設定目錄",

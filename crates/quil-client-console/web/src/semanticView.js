@@ -1,4 +1,4 @@
-import { canonicalMintPhase, semanticLabels } from './locale.js'
+import { canonicalMintPhase, semanticLabels, t } from './locale.js'
 
 function safeValue(value) {
   if (value == null || value === '') return '—'
@@ -56,7 +56,7 @@ export function normalizePage(data) {
     sections: normalizeSections(source.sections),
     tables: normalizeTables(source.tables),
     emptyState: source.empty_state && typeof source.empty_state === 'object'
-      ? { title: source.empty_state.title || '', detail: source.empty_state.detail || source.empty_state.message || '' }
+      ? { key: source.empty_state.key || 'default', title: source.empty_state.title || '', detail: source.empty_state.detail || source.empty_state.message || '' }
       : null,
   }
 }
@@ -71,6 +71,35 @@ export function displayValue(value) {
 export function compactValue(value, max = 56) {
   const text = displayValue(value)
   return text.length > max ? `${text.slice(0, Math.max(12, max - 18))}…${text.slice(-14)}` : text
+}
+
+export function semanticLabel(locale, slug, kind, item) {
+  const key = `semantic.${slug}.${kind}.${item?.key || ''}`
+  const translated = t(locale, key)
+  const fallback = kind === 'empty_detail' ? item?.detail : kind === 'empty_title' ? item?.title : item?.label || item?.title
+  return translated === key ? fallback || '' : translated
+}
+
+export function semanticValue(locale, slug, kind, key, value) {
+  if (['notice', 'action', 'health_notice'].includes(key)) return value
+  if (typeof value === 'boolean') return t(locale, `semantic.value.${value ? 'yes' : 'no'}`)
+  if (slug === 'health' && key === 'worker_coverage' && typeof value === 'string' && value.endsWith('/unknown')) {
+    return `${value.slice(0, -'unknown'.length)}${t(locale, 'semantic.health.value.unknown')}`
+  }
+  if (typeof value !== 'string' || value === '—') return value
+  const statusKeys = [
+    'error_conditions', 'warning_conditions', 'info_conditions', 'conditions_reported',
+    'master_store_write_failed', 'worker_capacity', 'store_status', 'store_io_verdict',
+    'severity', 'health_severity',
+  ]
+  if (!statusKeys.includes(key)) return value
+  const translationKeys = [`semantic.${slug}.${kind}.${key}.value.${value}`, `semantic.${slug}.value.${value}`]
+  if (['severity', 'health_severity'].includes(key)) translationKeys.push(`semantic.value.${value}`)
+  for (const translationKey of translationKeys) {
+    const translated = t(locale, translationKey)
+    if (translated !== translationKey) return translated
+  }
+  return value
 }
 
 const MINT_STEPS = [

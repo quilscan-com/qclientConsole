@@ -141,6 +141,7 @@ pub fn reduce_service(app: &mut App, event: ServiceEvent) {
                         .health
                         .index
                         .min(snapshot.workers.len().saturating_sub(1));
+                    app.health.condition_scroll = 0;
                     if snapshot.workers.is_empty() {
                         app.health.detail = false;
                     }

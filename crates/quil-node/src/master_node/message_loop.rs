@@ -2272,6 +2272,7 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
         let mut committee_builds_checked = std::time::Instant::now();
         let mut host_memory_watch = crate::mem_stats::HostMemoryWatch::default();
         let mut last_committee_peers = std::collections::HashSet::new();
+        let mut epoch_writes = super::disk_writes::EpochWrites::default();
         let mut pending_committee_policy: Option<(std::collections::HashSet<quil_p2p::PeerId>, Arc<std::sync::atomic::AtomicBool>)> = None;
         let mut remote_direct_allowed: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         let remote_direct_unsupported: Arc<parking_lot::Mutex<std::collections::HashSet<Vec<u8>>>> =
@@ -2448,8 +2449,9 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                                     members = builds.len(),
                                     behind = behind.len(),
                                     behind_global = %behind_list,
+                                    behind_releases = %super::committee_builds::behind_releases(&heads, &releases, global_head),
                                     global_head,
-                                    action = "nothing to fix on this node: these members' nodes stopped following GLOBAL, most likely on an outdated release; it ends when their operators upgrade",
+                                    action = super::committee_builds::BEHIND_ACTION,
                                     "app committee members behind GLOBAL"
                                 );
                             }
@@ -2495,6 +2497,13 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         .and_then(|f| f.header.as_ref().map(|h| h.frame_number))
                         .unwrap_or(0);
                     global_execution.observe(std::time::Instant::now(), cf_for_recv.materialized(), cf_for_recv.effective());
+                    // This process's disk writes, one line per epoch.
+                    if latest_frame > 0 {
+                        epoch_writes.observe(
+                            quil_types::consensus::epoch_for_frame(latest_frame),
+                            std::time::Instant::now(),
+                        );
+                    }
                     // Strict GLOBAL_PEER_INFO validation follows the GLOBAL head.
                     let strict_peer_info = quil_types::consensus::strict_peer_info_active(latest_frame);
                     if quil_p2p::set_strict_peer_info_validation(strict_peer_info) != strict_peer_info {
@@ -2737,6 +2746,10 @@ pub(crate) fn spawn(sup: &mut Supervisor<anyhow::Error>, args: MessageLoopArgs) 
                         // memory watch subtracts from `allocated_mb`.
                         labelling_buffers_mb = %crate::mem_stats::fmt_mb(
                             quil_engine::storage_jobs::held_bytes()
+                                .saturating_sub(quil_engine::storage_jobs::verifier_bytes())
+                        ),
+                        verifier_reserved_mb = %crate::mem_stats::fmt_mb(
+                            quil_engine::storage_jobs::verifier_bytes()
                         ),
                         "memory snapshot"
                     );

@@ -611,7 +611,10 @@ mod tests {
                 }
                 project_text_sources(&path, files);
             } else if path.extension().is_some_and(|extension| {
-                matches!(extension.to_str(), Some("rs" | "js" | "vue" | "md"))
+                matches!(
+                    extension.to_str(),
+                    Some("rs" | "js" | "vue" | "md" | "html")
+                )
             }) && !path.ends_with("web/src/locale.js")
             {
                 files.push(path);
@@ -851,6 +854,10 @@ mod tests {
             "\u{5bfc}\u{822a}",
             "\u{6d3b}\u{8dc3}",
             "\u{952e}",
+            "\u{5185}\u{5bb9}",
+            "\u{652f}\u{6301}\u{534f}\u{8bae}",
+            "\u{767b}\u{5165}\u{4f1a}\u{8bdd}",
+            concat!("zh", "-", "CN"),
         ];
         for path in files {
             let source = std::fs::read_to_string(&path).unwrap();
@@ -862,6 +869,11 @@ mod tests {
                 );
             }
         }
+
+        let built_web_index =
+            std::fs::read_to_string(env!("CARGO_MANIFEST_DIR").to_owned() + "/web/dist/index.html")
+                .unwrap();
+        assert!(!built_web_index.contains(concat!("zh", "-", "CN")));
     }
 }
 use serde::{Deserialize, Serialize};

@@ -219,7 +219,152 @@ pub struct HealthSnapshot {
     pub global_head_frame: u64,
     pub generated_unix_ms: u64,
     pub omitted_workers: u32,
+    pub worker_capacity: u32,
+    pub master_store_write_failed: bool,
+    pub store_io: Option<HealthStoreIoSnapshot>,
+    pub conditions_reported: bool,
+    pub conditions: Vec<HealthConditionSnapshot>,
+    pub unobserved_conditions: Vec<String>,
     pub workers: Vec<HealthWorkerSnapshot>,
+}
+
+impl HealthSnapshot {
+    pub fn conditions_for_worker<'a>(
+        &'a self,
+        filter_hex: &str,
+        core_id: u32,
+    ) -> Vec<&'a HealthConditionSnapshot> {
+        self.conditions
+            .iter()
+            .filter(|condition| {
+                condition
+                    .shards
+                    .iter()
+                    .any(|shard| shard.matches_worker(filter_hex, core_id))
+            })
+            .collect()
+    }
+
+    pub fn conditions_for_shard<'a>(
+        &'a self,
+        filter_hex: &str,
+    ) -> Vec<&'a HealthConditionSnapshot> {
+        self.conditions
+            .iter()
+            .filter(|condition| {
+                condition
+                    .shards
+                    .iter()
+                    .any(|shard| shard.matches_shard(filter_hex))
+            })
+            .collect()
+    }
+
+    pub fn highest_condition_for_worker(
+        &self,
+        filter_hex: &str,
+        core_id: u32,
+    ) -> Option<&HealthConditionSnapshot> {
+        self.conditions
+            .iter()
+            .filter(|condition| {
+                condition
+                    .shards
+                    .iter()
+                    .any(|shard| shard.matches_worker(filter_hex, core_id))
+            })
+            .min_by_key(|condition| condition.severity_rank())
+    }
+
+    pub fn highest_condition_for_shard(
+        &self,
+        filter_hex: &str,
+    ) -> Option<&HealthConditionSnapshot> {
+        self.conditions
+            .iter()
+            .filter(|condition| {
+                condition
+                    .shards
+                    .iter()
+                    .any(|shard| shard.matches_shard(filter_hex))
+            })
+            .min_by_key(|condition| condition.severity_rank())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthStoreIoSnapshot {
+    pub verdict: String,
+    pub slow_reason: String,
+    pub slow_secs: u64,
+    pub interval_secs: u32,
+    pub ended_unix_ms: u64,
+    pub canary_reads: u32,
+    pub canary_p50_us: u64,
+    pub canary_p99_us: u64,
+    pub canary_max_us: u64,
+    pub canary_pending_us: u64,
+    pub disk_reads: Option<u64>,
+    pub disk_writes: Option<u64>,
+    pub disk_read_await_us: Option<u64>,
+    pub disk_write_await_us: Option<u64>,
+    pub disk_busy_pct: Option<u32>,
+    pub figures: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthConditionSnapshot {
+    pub kind: String,
+    pub severity: String,
+    pub scope: String,
+    pub since_unix_ms: u64,
+    pub affected: u32,
+    pub tracked: u32,
+    pub threshold: u64,
+    pub notice: String,
+    pub action: String,
+    pub shards: Vec<HealthAffectedShardSnapshot>,
+    pub omitted_shards: u32,
+}
+
+impl HealthConditionSnapshot {
+    pub fn severity_rank(&self) -> u8 {
+        match self.severity.trim().to_ascii_lowercase().as_str() {
+            "error" => 0,
+            "warning" | "warn" => 1,
+            "info" => 2,
+            _ => 3,
+        }
+    }
+}
+
+pub fn highest_health_condition<'a>(
+    conditions: &[&'a HealthConditionSnapshot],
+) -> Option<&'a HealthConditionSnapshot> {
+    conditions
+        .iter()
+        .min_by_key(|condition| condition.severity_rank())
+        .copied()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthAffectedShardSnapshot {
+    pub filter_hex: String,
+    pub core_id: u32,
+    pub frame: u64,
+    pub unchanged_since_unix_ms: u64,
+    pub window_secs: u64,
+    pub lag_frames: u64,
+}
+
+impl HealthAffectedShardSnapshot {
+    fn matches_worker(&self, filter_hex: &str, core_id: u32) -> bool {
+        self.filter_hex == filter_hex && (self.core_id == 0 || self.core_id == core_id)
+    }
+
+    fn matches_shard(&self, filter_hex: &str) -> bool {
+        self.filter_hex == filter_hex && self.core_id == 0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -292,6 +437,7 @@ pub struct HealthWorkerSnapshot {
     pub core_id: u32,
     pub filter_hex: String,
     pub allocated: bool,
+    pub draining: bool,
     pub phase: String,
     pub blocker: String,
     pub observed_unix_ms: u64,
@@ -1145,6 +1291,126 @@ mod tests {
 
         assert_eq!(seal.recorded_unix_ms, 9);
         assert!(seal.is_recorded());
+    }
+
+    fn health_condition(kind: &str, filter_hex: &str, core_id: u32) -> HealthConditionSnapshot {
+        HealthConditionSnapshot {
+            kind: kind.into(),
+            severity: "warning".into(),
+            scope: "this node".into(),
+            since_unix_ms: 1,
+            affected: 1,
+            tracked: 1,
+            threshold: 0,
+            notice: "notice".into(),
+            action: "action".into(),
+            shards: vec![HealthAffectedShardSnapshot {
+                filter_hex: filter_hex.into(),
+                core_id,
+                frame: 2,
+                unchanged_since_unix_ms: 3,
+                window_secs: 4,
+                lag_frames: 5,
+            }],
+            omitted_shards: 0,
+        }
+    }
+
+    fn health_snapshot(conditions: Vec<HealthConditionSnapshot>) -> HealthSnapshot {
+        HealthSnapshot {
+            release: "2.1.0.25".into(),
+            build_fingerprint: "abababab".into(),
+            global_head_frame: 1,
+            generated_unix_ms: 2,
+            omitted_workers: 0,
+            worker_capacity: 1,
+            master_store_write_failed: false,
+            store_io: None,
+            conditions_reported: true,
+            conditions,
+            unobserved_conditions: Vec::new(),
+            workers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn worker_conditions_require_the_filter_and_accept_shard_or_exact_core_scope() {
+        let report = health_snapshot(vec![
+            health_condition("shard", "aa", 0),
+            health_condition("worker", "aa", 7),
+            health_condition("other core", "aa", 8),
+            health_condition("other filter", "bb", 7),
+        ]);
+
+        let kinds = report
+            .conditions_for_worker("aa", 7)
+            .into_iter()
+            .map(|condition| condition.kind.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(kinds, vec!["shard", "worker"]);
+    }
+
+    #[test]
+    fn shard_conditions_require_the_filter_and_exclude_worker_scoped_ones() {
+        let report = health_snapshot(vec![
+            health_condition("shard", "aa", 0),
+            health_condition("worker", "aa", 7),
+            health_condition("other filter", "bb", 0),
+        ]);
+
+        let kinds = report
+            .conditions_for_shard("aa")
+            .into_iter()
+            .map(|condition| condition.kind.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(kinds, vec!["shard"]);
+    }
+
+    #[test]
+    fn highest_health_condition_orders_known_severities_and_leaves_unknown_last() {
+        let mut error = health_condition("error", "aa", 0);
+        error.severity = "error".into();
+        let mut warning = health_condition("warning", "aa", 0);
+        warning.severity = "WARNING".into();
+        let mut info = health_condition("info", "aa", 0);
+        info.severity = "info".into();
+        let mut unknown = health_condition("unknown", "aa", 0);
+        unknown.severity = "future-severity".into();
+
+        assert_eq!(error.severity_rank(), 0);
+        assert_eq!(warning.severity_rank(), 1);
+        assert_eq!(info.severity_rank(), 2);
+        assert!(unknown.severity_rank() > info.severity_rank());
+        assert_eq!(
+            highest_health_condition(&[&unknown, &info, &warning, &error])
+                .unwrap()
+                .kind,
+            "error"
+        );
+    }
+
+    #[test]
+    fn direct_worker_and_shard_highest_condition_queries_match_scope_without_allocating() {
+        let mut shard_warning = health_condition("shard warning", "aa", 0);
+        shard_warning.severity = "warning".into();
+        let mut worker_error = health_condition("worker error", "aa", 7);
+        worker_error.severity = "error".into();
+        let mut other_core_error = health_condition("other core error", "aa", 8);
+        other_core_error.severity = "error".into();
+        let report = health_snapshot(vec![shard_warning, worker_error, other_core_error]);
+
+        assert_eq!(
+            report.highest_condition_for_worker("aa", 7).unwrap().kind,
+            "worker error"
+        );
+        assert_eq!(
+            report.highest_condition_for_shard("aa").unwrap().kind,
+            "shard warning"
+        );
+        assert!(report.highest_condition_for_worker("bb", 7).is_none());
+        assert!(report.highest_condition_for_shard("bb").is_none());
     }
 }
 

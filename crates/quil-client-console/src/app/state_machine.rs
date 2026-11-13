@@ -179,6 +179,23 @@ impl App {
         };
     }
 
+    fn scroll_health_conditions(&mut self, down: bool) {
+        let max = self.health.snapshot.as_ref().map_or(0, |snapshot| {
+            crate::ui::health_condition_scroll_max(
+                snapshot,
+                self.locale(),
+                self.viewport_width,
+                self.viewport_height,
+            )
+        });
+        let current = self.health.condition_scroll.min(max);
+        self.health.condition_scroll = if down {
+            current.saturating_add(3).min(max)
+        } else {
+            current.saturating_sub(3)
+        };
+    }
+
     pub fn page(&self) -> Page {
         self.page
     }
@@ -1053,6 +1070,7 @@ impl App {
             self.health.error = None;
             self.health.index = 0;
             self.health.detail = false;
+            self.health.condition_scroll = 0;
             self.health.in_flight = false;
             self.health.queued = None;
         }
@@ -1238,6 +1256,7 @@ impl App {
         }
         self.open(page);
         match page {
+            Page::Prover => self.queue_health_for_target(HealthTarget::SelfNode),
             Page::Runtime => self.queue_runtime(),
             Page::Health => self.queue_health_for_target(HealthTarget::SelfNode),
             Page::Logs => self.queue_log(),
@@ -1250,7 +1269,10 @@ impl App {
             Page::LegacyAssets => self.begin_legacy_migration(),
             Page::ConfidentialWallet => self.queue_confidential_wallet(),
             Page::PendingEscrows => self.queue_pending_escrows(),
-            Page::Shards => self.queue_shards(),
+            Page::Shards => {
+                self.queue_shards();
+                self.queue_health_for_target(HealthTarget::SelfNode);
+            }
             Page::ArchiveShards => self.queue_archive_shards(),
             _ => {}
         }
@@ -1515,6 +1537,7 @@ impl App {
         self.health.error = None;
         self.health.index = 0;
         self.health.detail = false;
+        self.health.condition_scroll = 0;
         self.health.queued = None;
     }
 }
@@ -2624,7 +2647,7 @@ fn handle_capability_input(app: &mut App, event: &InputEvent) -> bool {
 pub fn reduce_input(app: &mut App, event: InputEvent) {
     if !matches!(
         app.page,
-        Page::Prover | Page::Shards | Page::Capabilities | Page::CapabilityTask
+        Page::Prover | Page::Shards | Page::Health | Page::Capabilities | Page::CapabilityTask
     ) && matches!(event, InputEvent::PageUp | InputEvent::PageDown)
     {
         return;
@@ -2971,6 +2994,12 @@ pub fn reduce_input(app: &mut App, event: InputEvent) {
         }
         InputEvent::PageUp if app.page == Page::Shards => app.scroll_shard_detail(false, 5),
         InputEvent::PageDown if app.page == Page::Shards => app.scroll_shard_detail(true, 5),
+        InputEvent::PageUp if app.page == Page::Health => {
+            app.scroll_health_conditions(false);
+        }
+        InputEvent::PageDown if app.page == Page::Health => {
+            app.scroll_health_conditions(true);
+        }
         InputEvent::Up if app.narrow_prover_detail_open() => {
             app.scroll_prover_detail(false, 1);
         }
@@ -3738,7 +3767,11 @@ pub fn reduce_input(app: &mut App, event: InputEvent) {
         }
         InputEvent::Back => app.back(),
         InputEvent::Refresh => match app.page {
-            Page::Home | Page::NodeStatus | Page::Prover => app.begin_node_refresh(),
+            Page::Home | Page::NodeStatus => app.begin_node_refresh(),
+            Page::Prover => {
+                app.begin_node_refresh();
+                app.queue_health_for_target(HealthTarget::SelfNode);
+            }
             Page::Runtime => app.queue_runtime(),
             Page::Health => app.queue_health(),
             Page::PeerResolve => app.queue_peer_resolve(),
@@ -3753,7 +3786,10 @@ pub fn reduce_input(app: &mut App, event: InputEvent) {
             Page::ConfidentialWallet => app.queue_confidential_wallet(),
             Page::PendingEscrows => app.queue_pending_escrows(),
             Page::Hypergraph => app.queue_hypergraph(),
-            Page::Shards => app.queue_shards(),
+            Page::Shards => {
+                app.queue_shards();
+                app.queue_health_for_target(HealthTarget::SelfNode);
+            }
             Page::ArchiveShards => app.queue_archive_shards(),
             Page::Section(_)
             | Page::Configs
@@ -5049,8 +5085,8 @@ mod tests {
     }
 
     #[test]
-    fn node_snapshot_pages_refresh_only_the_node_snapshot() {
-        for page in [Page::Home, Page::NodeStatus, Page::Prover] {
+    fn home_and_node_status_refresh_only_the_node_snapshot() {
+        for page in [Page::Home, Page::NodeStatus] {
             let mut app = App {
                 page,
                 refresh_generation: 41,
@@ -5067,6 +5103,112 @@ mod tests {
             assert!(app.queued_log.is_none(), "{page:?}");
             assert!(app.runtime.queued.is_none(), "{page:?}");
             assert!(app.health.queued.is_none(), "{page:?}");
+        }
+    }
+
+    #[test]
+    fn opening_and_refreshing_prover_queue_local_health_alongside_node_state() {
+        let mut app = App {
+            page: Page::Section(Section::Prover),
+            route_stack: vec![Page::Home, Page::Section(Section::Prover)],
+            refresh_generation: 41,
+            ..Default::default()
+        };
+
+        app.open_page(Page::Prover);
+
+        assert_eq!(app.page, Page::Prover);
+        assert_eq!(
+            app.take_health_request(),
+            Some(HealthRequest {
+                generation: 1,
+                target: HealthTarget::SelfNode,
+            })
+        );
+        app.health.in_flight = false;
+
+        reduce_input(&mut app, InputEvent::Refresh);
+
+        assert_eq!(app.refresh_generation, 42);
+        assert!(app.loading);
+        assert_eq!(
+            app.take_health_request(),
+            Some(HealthRequest {
+                generation: 2,
+                target: HealthTarget::SelfNode,
+            })
+        );
+    }
+
+    #[test]
+    fn opening_and_refreshing_shards_keep_shard_and_local_health_reads_independent() {
+        let mut app = App {
+            page: Page::Section(Section::Prover),
+            route_stack: vec![Page::Home, Page::Section(Section::Prover)],
+            ..Default::default()
+        };
+
+        app.open_page(Page::Shards);
+
+        assert_eq!(app.page, Page::Shards);
+        assert_eq!(
+            app.take_shard_request(),
+            Some(ShardRequest {
+                generation: 1,
+                include_all: false,
+            })
+        );
+        assert_eq!(
+            app.take_health_request(),
+            Some(HealthRequest {
+                generation: 1,
+                target: HealthTarget::SelfNode,
+            })
+        );
+        app.shards.in_flight = false;
+        app.health.in_flight = false;
+
+        reduce_input(&mut app, InputEvent::Refresh);
+
+        assert_eq!(
+            app.take_shard_request(),
+            Some(ShardRequest {
+                generation: 2,
+                include_all: false,
+            })
+        );
+        assert_eq!(
+            app.take_health_request(),
+            Some(HealthRequest {
+                generation: 2,
+                target: HealthTarget::SelfNode,
+            })
+        );
+    }
+
+    #[test]
+    fn prover_and_shards_do_not_duplicate_a_pending_local_health_read() {
+        for page in [Page::Prover, Page::Shards] {
+            let request = HealthRequest {
+                generation: 7,
+                target: HealthTarget::SelfNode,
+            };
+            let mut app = App {
+                page: Page::Section(Section::Prover),
+                health: HealthState {
+                    target: HealthTarget::SelfNode,
+                    generation: 7,
+                    in_flight: true,
+                    queued: Some(request.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            app.open_page(page);
+
+            assert_eq!(app.health.generation, 7, "{page:?}");
+            assert_eq!(app.take_health_request(), Some(request), "{page:?}");
         }
     }
 

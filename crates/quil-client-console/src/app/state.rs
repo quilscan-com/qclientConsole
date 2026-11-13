@@ -720,6 +720,7 @@ pub struct HealthState {
     pub error: Option<String>,
     pub index: usize,
     pub detail: bool,
+    pub condition_scroll: u16,
     pub(crate) queued: Option<HealthRequest>,
 }
 

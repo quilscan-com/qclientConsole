@@ -40,7 +40,20 @@ mod wallet_operations;
 
 use ratatui::Frame;
 
-use crate::app::{App, Page};
+use crate::{
+    app::{App, Page},
+    domain::HealthSnapshot,
+    i18n::Locale,
+};
+
+pub(crate) fn health_condition_scroll_max(
+    snapshot: &HealthSnapshot,
+    locale: Locale,
+    viewport_width: u16,
+    viewport_height: u16,
+) -> u16 {
+    health::condition_scroll_max(snapshot, locale, viewport_width, viewport_height)
+}
 
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
     match app.page {

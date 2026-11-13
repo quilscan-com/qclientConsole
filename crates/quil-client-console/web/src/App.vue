@@ -6,7 +6,7 @@ import { createIdleTimer } from './idleTimer.js'
 import { applyDocumentLocale, canonicalMintPhase, LOCALES, semanticProofVerified, semanticValueIsAbsent, t } from './locale.js'
 import { findPage, NAV_GROUPS } from './navigation.js'
 import { unwrapPageResponse } from './pageResponse.js'
-import { compactValue, displayValue, normalizePage, rewardProgress, semanticField } from './semanticView.js'
+import { compactValue, displayValue, normalizePage, rewardProgress, semanticField, semanticLabel, semanticValue } from './semanticView.js'
 import LegacyMigration from './components/LegacyMigration.vue'
 
 const IDLE_TIMEOUT_MS = 30 * 60 * 1000
@@ -136,6 +136,10 @@ function firstSemantic(keys) {
 function optionalSemantic(keys) {
   const value = firstSemantic(keys)
   return semanticValueIsAbsent(value) ? null : value
+}
+
+function isEvidenceColumn(key) {
+  return ['notice', 'action', 'health_notice'].includes(key)
 }
 
 function safeLocaleTime() {
@@ -754,13 +758,13 @@ onBeforeUnmount(teardown)
           </section>
         </template>
 
-        <section v-if="pageView.stats.length && activePage.layout !== 'overview' && activePage.layout !== 'capabilities' && activeSlug !== 'rewards' && activeSlug !== 'other'" class="metric-grid page-metrics"><article v-for="item in pageView.stats" :key="item.key" class="metric-card" :class="item.tone"><div class="metric-head"><span></span><p>{{ item.label }}</p></div><strong>{{ displayValue(item.value) }}</strong><small v-if="item.hint">{{ item.hint }}</small></article></section>
+        <section v-if="pageView.stats.length && activePage.layout !== 'overview' && activePage.layout !== 'capabilities' && activeSlug !== 'rewards' && activeSlug !== 'other'" class="metric-grid page-metrics"><article v-for="item in pageView.stats" :key="item.key" class="metric-card" :class="item.tone"><div class="metric-head"><span></span><p>{{ semanticLabel(locale, activeSlug, 'stat', item) }}</p></div><strong>{{ displayValue(semanticValue(locale, activeSlug, 'stat', item.key, item.value)) }}</strong><small v-if="item.hint">{{ item.hint }}</small></article></section>
         <section v-if="pageLoading && activePage.layout !== 'overview' && activePage.layout !== 'capabilities'" class="data-card loading-card"><div class="loader"></div><p>{{ t(locale, 'common.loading') }} {{ activePageTitle }}</p></section>
 
         <template v-else-if="activePage.layout !== 'overview' && activePage.layout !== 'capabilities' && activeSlug !== 'rewards' && activeSlug !== 'other'">
-          <section v-for="section in pageView.sections" :key="section.key" class="data-card semantic-section"><div class="section-heading"><div><h3>{{ section.title }}</h3><p v-if="section.description">{{ section.description }}</p></div><span>{{ String(pageView.sections.indexOf(section) + 1).padStart(2, '0') }}</span></div><dl class="semantic-fields"><div v-for="field in section.fields" :key="field.key"><dt>{{ field.label }}</dt><dd :class="field.tone" :title="displayValue(field.value)">{{ compactValue(field.value) }}<button v-if="field.copyable" :aria-label="t(locale, 'common.copy')" @click="copyValue(field.value)">⧉</button></dd></div></dl></section>
-          <section v-for="table in pageView.tables" :key="table.key" class="data-card table-card"><div class="section-heading"><div><h3>{{ table.title }}</h3><p v-if="table.description">{{ table.description }}</p></div><span>{{ table.rows.length }}</span></div><div class="table-scroll"><table><thead><tr><th v-for="column in table.columns" :key="column.key" :class="`align-${column.align || 'left'}`">{{ column.label }}</th></tr></thead><tbody><tr v-for="(row, index) in table.rows" :key="row.id || row.name || index"><td v-for="column in table.columns" :key="column.key" :class="`align-${column.align || 'left'}`" :title="displayValue(row[column.key])">{{ compactValue(row[column.key]) }}</td></tr></tbody></table></div></section>
-          <section v-if="pageView.emptyState || (!hasSemanticContent && !pageError)" class="data-card empty-state"><span aria-hidden="true">◇</span><div><h3>{{ pageView.emptyState?.title || t(locale, 'common.empty') }}</h3><p>{{ pageView.emptyState?.detail || t(locale, 'common.unavailable') }}</p></div></section>
+          <section v-for="section in pageView.sections" :key="section.key" class="data-card semantic-section"><div class="section-heading"><div><h3>{{ semanticLabel(locale, activeSlug, 'section', section) }}</h3><p v-if="section.description">{{ section.description }}</p></div><span>{{ String(pageView.sections.indexOf(section) + 1).padStart(2, '0') }}</span></div><dl class="semantic-fields"><div v-for="field in section.fields" :key="field.key"><dt>{{ semanticLabel(locale, activeSlug, 'field', field) }}</dt><dd :class="field.tone" :title="displayValue(semanticValue(locale, activeSlug, 'field', field.key, field.value))">{{ compactValue(semanticValue(locale, activeSlug, 'field', field.key, field.value)) }}<button v-if="field.copyable" :aria-label="t(locale, 'common.copy')" @click="copyValue(field.value)">⧉</button></dd></div></dl></section>
+          <section v-for="table in pageView.tables" :key="table.key" class="data-card table-card"><div class="section-heading"><div><h3>{{ semanticLabel(locale, activeSlug, 'table', table) }}</h3><p v-if="table.description">{{ table.description }}</p></div><span>{{ table.rows.length }}</span></div><div class="table-scroll"><table class="semantic-table"><thead><tr><th v-for="column in table.columns" :key="column.key" scope="col" :class="`align-${column.align || 'left'}`">{{ semanticLabel(locale, activeSlug, 'column', column) }}</th></tr></thead><tbody><tr v-for="(row, index) in table.rows" :key="row.id || row.name || index"><td v-for="column in table.columns" :key="column.key" :class="[`align-${column.align || 'left'}`, { 'evidence-cell': isEvidenceColumn(column.key) }]" :data-label="semanticLabel(locale, activeSlug, 'column', column)" :title="displayValue(semanticValue(locale, activeSlug, 'column', column.key, row[column.key]))">{{ isEvidenceColumn(column.key) ? displayValue(semanticValue(locale, activeSlug, 'column', column.key, row[column.key])) : compactValue(semanticValue(locale, activeSlug, 'column', column.key, row[column.key])) }}</td></tr></tbody></table></div></section>
+          <section v-if="pageView.emptyState || (!hasSemanticContent && !pageError)" class="data-card empty-state"><span aria-hidden="true">◇</span><div><h3>{{ semanticLabel(locale, activeSlug, 'empty_title', pageView.emptyState) || t(locale, 'common.empty') }}</h3><p>{{ semanticLabel(locale, activeSlug, 'empty_detail', pageView.emptyState) || t(locale, 'common.unavailable') }}</p></div></section>
         </template>
 
         <footer><span>{{ t(locale, 'footer.config') }} <b>{{ context?.active_config_name || '—' }}</b></span><span>{{ t(locale, 'footer.updated') }} <b>{{ lastUpdated || '—' }}</b></span><span>qclient-console Web</span></footer>

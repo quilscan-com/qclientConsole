@@ -46,6 +46,83 @@ const groupKeys = {
   help: ['Help', '說明', 'ヘルプ', 'Aide'],
 }
 
+const semanticKeys = {
+  'health.stat.error_conditions': ['Errors', '錯誤', 'エラー', 'Erreurs'],
+  'health.stat.warning_conditions': ['Warnings', '警告', '警告', 'Avertissements'],
+  'health.stat.info_conditions': ['Information', '資訊', '情報', 'Informations'],
+  'health.stat.worker_coverage': ['Reported / configured workers', '已報告 / 已設定 Worker', '報告済み / 設定済み Worker', 'Workers signalés / configurés'],
+  'health.stat.draining_workers': ['Draining workers', '正在排空的 Worker', 'ドレイン中の Worker', 'Workers en vidage'],
+  'health.stat.store_status': ['Store status', 'Store 狀態', 'Store 状態', 'État du Store'],
+  'health.stat.omitted_workers': ['Omitted workers', '已省略 Worker', '省略された Worker', 'Workers omis'],
+  'health.section.report': ['Health report', '健康報告', 'ヘルスレポート', 'Rapport de santé'],
+  'health.section.store_io': ['Store I/O', 'Store I/O', 'Store I/O', 'E/S du Store'],
+  'health.field.release': ['Release', '版本', 'リリース', 'Version'],
+  'health.field.build_fingerprint': ['Build fingerprint', '建置指紋', 'ビルド指紋', 'Empreinte de build'],
+  'health.field.generated_unix_ms': ['Generated at (ms)', '產生時間 (ms)', '生成時刻 (ms)', 'Généré à (ms)'],
+  'health.field.conditions_reported': ['Conditions reported', 'Conditions 回報狀態', 'Condition 報告状態', 'Conditions signalées'],
+  'health.field.master_store_write_failed': ['Master Store writes', 'Master Store 寫入', 'Master Store 書き込み', 'Écritures du Store principal'],
+  'health.field.unobserved_conditions': ['Unobserved conditions', '未觀測 Conditions', '未観測 Condition', 'Conditions non observées'],
+  'health.field.global_head_frame': ['Global head', 'Global Head', 'Global Head', 'Tête globale'],
+  'health.field.worker_capacity': ['Configured workers', '已設定 Worker', '設定済み Worker', 'Workers configurés'],
+  'health.field.store_io_verdict': ['Verdict', '判定', '判定', 'Verdict'],
+  'health.field.store_io_slow_reason': ['Slow reason', '緩慢原因', '低速の原因', 'Cause du ralentissement'],
+  'health.field.store_io_slow_secs': ['Slow seconds', '緩慢秒數', '低速秒数', 'Secondes lentes'],
+  'health.field.store_io_interval_secs': ['Interval seconds', '區間秒數', '区間秒数', 'Intervalle en secondes'],
+  'health.field.store_io_ended_unix_ms': ['Ended at (ms)', '結束時間 (ms)', '終了時刻 (ms)', 'Terminé à (ms)'],
+  'health.field.store_io_figures': ['Store I/O figures', 'Store I/O 數據', 'Store I/O 数値', 'Mesures E/S du Store'],
+  'health.field.canary_reads': ['Canary reads', 'Canary 讀取', 'Canary 読み取り', 'Lectures canary'],
+  'health.field.canary_p50_us': ['Canary p50 (µs)', 'Canary p50 (µs)', 'Canary p50 (µs)', 'Canary p50 (µs)'],
+  'health.field.canary_p99_us': ['Canary p99 (µs)', 'Canary p99 (µs)', 'Canary p99 (µs)', 'Canary p99 (µs)'],
+  'health.field.canary_max_us': ['Canary max (µs)', 'Canary 最大值 (µs)', 'Canary 最大値 (µs)', 'Canary max (µs)'],
+  'health.field.canary_pending_us': ['Canary pending (µs)', 'Canary 待處理 (µs)', 'Canary 保留時間 (µs)', 'Canary en attente (µs)'],
+  'health.field.disk_reads': ['Disk reads', '磁碟讀取', 'ディスク読み取り', 'Lectures disque'],
+  'health.field.disk_writes': ['Disk writes', '磁碟寫入', 'ディスク書き込み', 'Écritures disque'],
+  'health.field.disk_read_await_us': ['Disk read wait (µs)', '磁碟讀取等待 (µs)', 'ディスク読み取り待機 (µs)', 'Attente lecture disque (µs)'],
+  'health.field.disk_write_await_us': ['Disk write wait (µs)', '磁碟寫入等待 (µs)', 'ディスク書き込み待機 (µs)', 'Attente écriture disque (µs)'],
+  'health.field.disk_busy_pct': ['Disk busy (%)', '磁碟忙碌度 (%)', 'ディスク使用率 (%)', 'Disque occupé (%)'],
+  'health.table.conditions': ['Health conditions', '健康 Conditions', 'ヘルス Condition', 'Conditions de santé'],
+  'health.table.workers': ['Worker health', 'Worker 健康狀態', 'Worker ヘルス', 'Santé des Workers'],
+  'health.column.severity': ['Severity', '嚴重度', '重大度', 'Sévérité'],
+  'health.column.scope': ['Scope', '範圍', '範囲', 'Portée'],
+  'health.column.kind': ['Kind', '類型', '種類', 'Type'],
+  'health.column.since': ['Since (ms)', '開始時間 (ms)', '開始時刻 (ms)', 'Depuis (ms)'],
+  'health.column.affected': ['Affected', '受影響', '影響あり', 'Affectés'],
+  'health.column.tracked': ['Tracked', '追蹤中', '追跡中', 'Suivis'],
+  'health.column.notice': ['Notice', '說明', '通知', 'Avis'],
+  'health.column.action': ['Action', '建議動作', '推奨操作', 'Action'],
+  'health.column.omitted': ['Omitted', '已省略', '省略', 'Omis'],
+  'health.column.core_id': ['Core', 'Core', 'Core', 'Core'],
+  'health.column.filter': ['Filter', 'Filter', 'Filter', 'Filter'],
+  'health.column.allocated': ['Allocated', '已分配', '割り当て済み', 'Alloué'],
+  'health.column.draining': ['Draining', '排空中', 'ドレイン中', 'En vidage'],
+  'health.column.phase': ['Phase', '階段', 'フェーズ', 'Phase'],
+  'health.column.blocker': ['Blocker', '阻塞原因', 'ブロッカー', 'Blocage'],
+  'health.column.materialized_frame': ['Materialized frame', '已物化 Frame', '実体化 Frame', 'Frame matérialisée'],
+  'health.column.awaited_frame': ['Awaited frame', '等待 Frame', '待機 Frame', 'Frame attendue'],
+  'health.column.health_severity': ['Health severity', '健康嚴重度', 'ヘルス重大度', 'Sévérité de santé'],
+  'health.column.health_notice': ['Health notice', '健康說明', 'ヘルス通知', 'Avis de santé'],
+  'prover.column.health_severity': ['Health severity', '健康嚴重度', 'ヘルス重大度', 'Sévérité de santé'],
+  'prover.column.health_notice': ['Health notice', '健康說明', 'ヘルス通知', 'Avis de santé'],
+  'shards.column.health_severity': ['Health severity', '健康嚴重度', 'ヘルス重大度', 'Sévérité de santé'],
+  'shards.column.health_notice': ['Health notice', '健康說明', 'ヘルス通知', 'Avis de santé'],
+  'value.yes': ['Yes', '是', 'はい', 'Oui'],
+  'value.no': ['No', '否', 'いいえ', 'Non'],
+  'value.error': ['Error', '錯誤', 'エラー', 'Erreur'],
+  'value.warning': ['Warning', '警告', '警告', 'Avertissement'],
+  'value.info': ['Info', '資訊', '情報', 'Info'],
+  'health.value.reported': ['Reported', '已報告', '報告済み', 'Signalé'],
+  'health.value.unreported': ['Unreported', '未報告', '未報告', 'Non signalé'],
+  'health.value.unknown': ['Unknown', '未知', '不明', 'Inconnu'],
+  'health.value.write_failed': ['Write failed', '寫入失敗', '書き込み失敗', 'Échec d’écriture'],
+  'health.value.no_failure': ['No failure detected', '未偵測到失敗', '障害未検出', 'Aucun échec détecté'],
+  'health.value.slow': ['Slow', '緩慢', '低速', 'Lent'],
+  'health.value.ok': ['OK', '正常', '正常', 'OK'],
+  'health.value.unmeasured': ['Unmeasured', '未測量', '未測定', 'Non mesuré'],
+  'health.value.unspecified': ['Unspecified', '未指定', '未指定', 'Non spécifié'],
+  'health.empty_title.workers': ['No worker health data', '暫無 Worker 健康資料', 'Worker ヘルスデータなし', 'Aucune donnée de santé Worker'],
+  'health.empty_detail.workers': ['The node health report did not include worker details.', '節點健康報告中沒有 Worker 明細。', 'ノードのヘルスレポートに Worker の詳細がありません。', 'Le rapport de santé du nœud ne contient aucun détail Worker.'],
+}
+
 const capabilityText = {
   en: {
     'page.qclient-tasks': 'QClient task center',
@@ -657,6 +734,13 @@ for (const [slug, values] of Object.entries(pageKeys)) {
 }
 for (const [group, values] of Object.entries(groupKeys)) {
   const key = `group.${group}`
+  base[key] = values[0]
+  overrides['zh-TW'][key] = values[1]
+  overrides.ja[key] = values[2]
+  overrides.fr[key] = values[3]
+}
+for (const [suffix, values] of Object.entries(semanticKeys)) {
+  const key = `semantic.${suffix}`
   base[key] = values[0]
   overrides['zh-TW'][key] = values[1]
   overrides.ja[key] = values[2]

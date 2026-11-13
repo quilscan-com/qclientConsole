@@ -88,6 +88,15 @@ test_*.py
 *_test.py
 /scripts/test-persistent-storage.py
 /crates/quil-lattice-proof-sys/tools/check_native_codec.py
+/.nextest.toml
+/TESTING.md
+**/Testfile
+**/fuzz/
+/crates/devnet/test.sh
+/crates/jmt/src/types/proof/proptest_proof.rs
+/crates/quil-lattice-proof-sys/tools/build_test_binary.py
+/crates/verenc/run_size_benchmarks.sh
+/scripts/devnet-smoke.sh
 
 # Upstream local-devnet fixtures contain published test credentials. They are
 # not used by the Console distribution and stay only in this local checkout.

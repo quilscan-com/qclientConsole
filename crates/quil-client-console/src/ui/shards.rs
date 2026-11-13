@@ -10,7 +10,9 @@ use ratatui::{
 use crate::{
     allocation::allocation_lifecycle,
     app::{selected_shard_allocation_index, App, ShardFocus},
-    domain::{ProverAction, ShardInfoSnapshot, ShardSnapshot},
+    domain::{
+        HealthConditionSnapshot, HealthTarget, ProverAction, ShardInfoSnapshot, ShardSnapshot,
+    },
     i18n::{allocation_lifecycle_status_label, format_allocation_action_hint, t, Locale},
 };
 
@@ -294,6 +296,7 @@ fn draw_snapshot(frame: &mut Frame<'_>, app: &App, snapshot: &ShardInfoSnapshot,
         let columns = catalog_columns(area);
         draw_list(
             frame,
+            app,
             snapshot,
             app.shards.index,
             columns[0],
@@ -314,12 +317,21 @@ fn draw_snapshot(frame: &mut Frame<'_>, app: &App, snapshot: &ShardInfoSnapshot,
     } else if app.shards.focus == ShardFocus::FreeCores {
         draw_idle_cores(frame, app, area);
     } else {
-        draw_list(frame, snapshot, app.shards.index, area, app.locale(), true);
+        draw_list(
+            frame,
+            app,
+            snapshot,
+            app.shards.index,
+            area,
+            app.locale(),
+            true,
+        );
     }
 }
 
 fn draw_list(
     frame: &mut Frame<'_>,
+    app: &App,
     snapshot: &ShardInfoSnapshot,
     index: usize,
     area: Rect,
@@ -327,6 +339,13 @@ fn draw_list(
     focused: bool,
 ) {
     let items = snapshot.shards.iter().map(|shard| {
+        let condition = shard_health_condition(app, shard);
+        let health_marker = condition.map_or("", |condition| {
+            super::health::severity_marker(&condition.severity)
+        });
+        let health_prefix = (!health_marker.is_empty())
+            .then(|| format!("{health_marker} "))
+            .unwrap_or_default();
         let marker = if shard.is_allocated {
             t(locale, UiText::Mine)
         } else {
@@ -349,17 +368,18 @@ fn draw_list(
             .unwrap_or_else(|| t(locale, UiText::RewardUnknown).into());
         let text = if area.width < 62 {
             format!(
-                "{marker:<4} {}  R {ring}  {reward}",
+                "{health_prefix}{marker:<4} {}  R {ring}  {reward}",
                 compact_middle(&shard.filter_hex, 12),
             )
         } else {
             format!(
-                "{marker:<4} {}  Ring {ring:<4}  Prover {:<4}  {reward}",
+                "{health_prefix}{marker:<4} {}  Ring {ring:<4}  Prover {:<4}  {reward}",
                 compact_middle(&shard.filter_hex, 18),
                 shard.active_provers,
             )
         };
         ListItem::new(text)
+            .style(condition.map_or_else(theme::normal, super::health::condition_style))
     });
     let mut state = ListState::default().with_selected(Some(index));
     frame.render_stateful_widget(
@@ -371,11 +391,7 @@ fn draw_list(
                     theme::muted()
                 }),
             )
-            .highlight_style(if focused {
-                theme::selected()
-            } else {
-                theme::normal()
-            })
+            .highlight_style(Style::default().add_modifier(Modifier::BOLD))
             .highlight_symbol("› "),
         area,
         &mut state,
@@ -588,6 +604,19 @@ fn detail_lines_locale(
             ),
         ),
     ];
+    if let Some(condition) = shard_health_condition(app, shard) {
+        fields.insert(
+            1,
+            DetailField::new(
+                t(locale, UiText::Health),
+                format!(
+                    "{} {}",
+                    super::health::severity_marker(&condition.severity),
+                    condition.notice
+                ),
+            ),
+        );
+    }
     if app.loading {
         fields.push(DetailField::new(
             t(locale, UiText::LocalAllocationStatus),
@@ -654,6 +683,20 @@ fn detail_lines_locale(
         DetailField::new(t(locale, UiText::AllocationReason), reason),
     ]);
     render_fields(fields, width)
+}
+
+fn shard_health_condition<'a>(
+    app: &'a App,
+    shard: &ShardSnapshot,
+) -> Option<&'a HealthConditionSnapshot> {
+    if app.health.target != HealthTarget::SelfNode {
+        return None;
+    }
+    let health = app.health.snapshot.as_ref()?;
+    if !health.conditions_reported {
+        return None;
+    }
+    health.highest_condition_for_shard(&shard.filter_hex)
 }
 
 fn estimate(value: Option<&str>, locale: Locale) -> String {
